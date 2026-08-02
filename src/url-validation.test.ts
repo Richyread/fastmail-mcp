@@ -35,6 +35,37 @@ describe('validateFastmailUrl (default policy)', () => {
     );
   });
 
+  it('accepts a regional api shard', () => {
+    // Fastmail moved this account to the Philadelphia shard; session discovery
+    // returns phl.api.fastmail.com and the exact-match allowlist rejected it.
+    const url = validateFastmailUrl('https://phl.api.fastmail.com/jmap/api/', 'session.apiUrl');
+    assert.equal(url.hostname, 'phl.api.fastmail.com');
+  });
+
+  it('accepts a regional user-content shard', () => {
+    const url = validateFastmailUrl(
+      'https://phl-www.fastmailusercontent.com/jmap/download/x/y/z',
+      'downloadUrl',
+    );
+    assert.equal(url.hostname, 'phl-www.fastmailusercontent.com');
+  });
+
+  it('rejects a host that merely ends with the api hostname, no label boundary', () => {
+    // 'evilapi.fastmail.com' ends with 'api.fastmail.com' but not with
+    // '.api.fastmail.com' — the leading dot on the suffix is what stops this.
+    assert.throws(
+      () => validateFastmailUrl('https://evilapi.fastmail.com/jmap/api/', 'baseUrl'),
+      /not in the Fastmail allowlist/,
+    );
+  });
+
+  it('rejects an attacker domain that prefixes an allowlisted suffix', () => {
+    assert.throws(
+      () => validateFastmailUrl('https://phl.api.fastmail.com.attacker.com/', 'baseUrl'),
+      /not in the Fastmail allowlist/,
+    );
+  });
+
   it('rejects host that ends with allowlisted domain (suffix-attack)', () => {
     // Confirms exact-match check, not endsWith.
     assert.throws(
