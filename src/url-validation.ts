@@ -1,30 +1,24 @@
 // Validates URLs that will receive the bearer token. Restricts to approved
 // Fastmail origins by default, with an explicit opt-out for self-hosted JMAP.
 
-const FASTMAIL_ALLOWED_HOSTS: ReadonlySet<string> = new Set([
-  'api.fastmail.com',
-  'www.fastmailusercontent.com',
-]);
-
-// Fastmail shards accounts onto regional hosts and returns those from session
-// discovery: an account on the Philadelphia shard is handed
-// `phl.api.fastmail.com` and `phl-www.fastmailusercontent.com` rather than the
-// two bare hosts above. Both are legitimate Fastmail endpoints, so the
-// allowlist matches by suffix as well as exactly.
-//
-// Every suffix starts with a dot, which anchors the match at a label boundary.
-// 'evilapi.fastmail.com' does not end with '.api.fastmail.com', and neither
-// does 'api.fastmail.com.attacker.com' — the suffix-attack cases stay rejected.
-// Only the api host gains subdomains, not the whole of fastmail.com, so
-// 'www.fastmail.com' remains off the list.
-const FASTMAIL_ALLOWED_HOST_SUFFIXES: readonly string[] = [
-  '.api.fastmail.com',
-  '.fastmailusercontent.com',
+// Fastmail's session discovery hands back region-pinned endpoints, so the
+// allowlist matches host *shapes*, not a fixed list of names. Observed live:
+//   apiUrl / uploadUrl -> phl.api.fastmail.com   (region as a leading label)
+//   downloadUrl        -> phl-www.fastmailusercontent.com  (region hyphenated
+//                                                           onto the `www` label)
+// The two hosts spell the region differently, hence two patterns. Both are
+// anchored at each end and the region part excludes `.`, so a single label is
+// all that can precede the fixed suffix — `evil.phl-www.fastmailusercontent.com`
+// and `evilapi.fastmail.com.attacker.com` both still fail.
+const REGION = '[a-z0-9]+(?:-[a-z0-9]+)*';
+const FASTMAIL_ALLOWED_HOST_PATTERNS: readonly RegExp[] = [
+  new RegExp(`^(?:${REGION}\\.)?api\\.fastmail\\.com$`),
+  new RegExp(`^(?:${REGION}-)?www\\.fastmailusercontent\\.com$`),
 ];
 
 function isAllowedFastmailHost(hostname: string): boolean {
-  if (FASTMAIL_ALLOWED_HOSTS.has(hostname)) return true;
-  return FASTMAIL_ALLOWED_HOST_SUFFIXES.some((suffix) => hostname.endsWith(suffix));
+  // URL parsing already lowercases and punycodes the hostname.
+  return FASTMAIL_ALLOWED_HOST_PATTERNS.some((re) => re.test(hostname));
 }
 
 /**
@@ -32,8 +26,8 @@ function isAllowedFastmailHost(hostname: string): boolean {
  *
  * Default policy:
  *   - Must be HTTPS.
- *   - Hostname must be in FASTMAIL_ALLOWED_HOSTS, or a regional shard of one
- *     (see FASTMAIL_ALLOWED_HOST_SUFFIXES).
+ *   - Hostname must match FASTMAIL_ALLOWED_HOST_PATTERNS: Fastmail's API and
+ *     user-content hosts, with or without a regional prefix.
  *
  * When `allowUnsafe=true` (e.g. user opted in via FASTMAIL_ALLOW_UNSAFE_BASE_URL
  * for a self-hosted JMAP server):
@@ -58,11 +52,44 @@ export function validateFastmailUrl(input: string, fieldName: string, allowUnsaf
   }
   if (!allowUnsafe && !isAllowedFastmailHost(parsed.hostname)) {
     throw new Error(
-      `${fieldName} host '${parsed.hostname}' is not in the Fastmail allowlist. ` +
+      `${fieldName} host '${parsed.hostname}' is not in the Fastmail allowlist ` +
+      `(api.fastmail.com and www.fastmailusercontent.com, each with an optional ` +
+      `regional prefix such as phl.api.fastmail.com). ` +
       `Set FASTMAIL_ALLOW_UNSAFE_BASE_URL=true to opt in for self-hosted JMAP servers.`,
     );
   }
   return parsed;
 }
 
-export const FASTMAIL_ALLOWED_HOSTS_FOR_TEST = FASTMAIL_ALLOWED_HOSTS;
+/**
+ * Validate a user-configured HTTPS endpoint (e.g. the WebDAV base URL).
+ *
+ * Unlike validateFastmailUrl there is deliberately NO host allowlist — the
+ * host being user-chosen is the point (Fastmail Files, Nextcloud, ...), and
+ * the value comes from server env, never from tool arguments. Enforced:
+ *   - HTTPS only (credentials travel with every request).
+ *   - No embedded userinfo (credentials belong in the Authorization header,
+ *     not in a URL that ends up in logs and error messages).
+ *   - No query or fragment (a collection URL has neither; their presence
+ *     signals a copy-paste mistake or something more creative).
+ *
+ * Throws on rejection; returns the parsed URL on success.
+ */
+export function validateHttpsUrl(input: string, fieldName: string): URL {
+  let parsed: URL;
+  try {
+    parsed = new URL(input);
+  } catch {
+    throw new Error(`${fieldName} is not a valid URL`);
+  }
+  if (parsed.protocol !== 'https:') {
+    throw new Error(`${fieldName} must use HTTPS (got: ${parsed.protocol}).`);
+  }
+  if (parsed.username || parsed.password) {
+    throw new Error(`${fieldName} must not embed credentials in the URL; use the username/password settings.`);
+  }
+  if (parsed.search || parsed.hash) {
+    throw new Error(`${fieldName} must be a plain collection URL without query or fragment.`);
+  }
+  return parsed;
+}

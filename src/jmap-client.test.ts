@@ -1,14 +1,14 @@
 import { describe, it, beforeEach, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { homedir } from 'os';
-import { resolve, join, basename } from 'path';
+import { resolve, join, basename, sep } from 'path';
 import { JmapClient } from './jmap-client.js';
 import { FastmailAuth } from './auth.js';
 
 // ---------- helpers ----------
 
 const ACCOUNT_ID = 'acct-123';
-const IDENTITY = { id: 'id-1', email: 'me@example.com', mayDelete: false };
+const IDENTITY = { id: 'id-1', name: 'Test User', email: 'me@example.com', mayDelete: false };
 const DRAFTS_MAILBOX = { id: 'mb-drafts', name: 'Drafts', role: 'drafts' };
 
 function makeClient(): JmapClient {
@@ -82,7 +82,7 @@ describe('createDraft', () => {
     // email object shape
     const emailObj = request.methodCalls[0][1].create.draft;
     assert.equal(emailObj.subject, 'Test');
-    assert.deepEqual(emailObj.from, [{ email: 'me@example.com' }]);
+    assert.deepEqual(emailObj.from, [{ name: 'Test User', email: 'me@example.com' }]);
     assert.deepEqual(emailObj.keywords, { $draft: true });
     assert.equal(emailObj.mailboxIds[DRAFTS_MAILBOX.id], true);
   });
@@ -161,7 +161,7 @@ describe('createDraft', () => {
 
   // 7. Custom from address used correctly
   it('uses custom from address when provided', async () => {
-    const altIdentity = { id: 'id-2', email: 'alias@example.com', mayDelete: true };
+    const altIdentity = { id: 'id-2', name: 'Alias User', email: 'alias@example.com', mayDelete: true };
     mock.method(client, 'getIdentities', async () => [IDENTITY, altIdentity]);
 
     const makeReq = mock.method(client, 'makeRequest', async () => ({
@@ -173,7 +173,7 @@ describe('createDraft', () => {
     await client.createDraft({ subject: 'Hi', from: 'alias@example.com' });
 
     const emailObj = makeReq.mock.calls[0].arguments[0].methodCalls[0][1].create.draft;
-    assert.deepEqual(emailObj.from, [{ email: 'alias@example.com' }]);
+    assert.deepEqual(emailObj.from, [{ name: 'Alias User', email: 'alias@example.com' }]);
   });
 
   // 8. Invalid from address throws
@@ -189,7 +189,7 @@ describe('createDraft', () => {
 
   // 8b. Wildcard identity matches concrete from address
   it('matches wildcard identity for from address', async () => {
-    const wildcardIdentity = { id: 'id-wild', email: '*@example.com', mayDelete: true };
+    const wildcardIdentity = { id: 'id-wild', name: 'Wild User', email: '*@example.com', mayDelete: true };
     mock.method(client, 'getIdentities', async () => [wildcardIdentity]);
 
     const makeReq = mock.method(client, 'makeRequest', async () => ({
@@ -201,7 +201,7 @@ describe('createDraft', () => {
     await client.createDraft({ subject: 'Hi', from: 'work@example.com' });
 
     const emailObj = makeReq.mock.calls[0].arguments[0].methodCalls[0][1].create.draft;
-    assert.deepEqual(emailObj.from, [{ email: 'work@example.com' }]);
+    assert.deepEqual(emailObj.from, [{ name: 'Wild User', email: 'work@example.com' }]);
   });
 
   // 8c. Bare @ rejected (no local part)
@@ -225,6 +225,33 @@ describe('createDraft', () => {
 
     await assert.rejects(
       () => client.createDraft({ subject: 'Hi', from: 'work@other.com' }),
+      (err: Error) => {
+        assert.match(err.message, /not verified/i);
+        return true;
+      },
+    );
+  });
+
+  // 8e. Composite/injection from-string rejected even though it ends in the wildcard domain
+  it('rejects a composite from address against a wildcard identity', async () => {
+    const wildcardIdentity = { id: 'id-wild', email: '*@example.com', mayDelete: true };
+    mock.method(client, 'getIdentities', async () => [wildcardIdentity]);
+
+    await assert.rejects(
+      () => client.createDraft({ subject: 'Hi', from: 'attacker@evil.com,me@example.com' }),
+      (err: Error) => {
+        assert.match(err.message, /not verified/i);
+        return true;
+      },
+    );
+  });
+
+  it('rejects a from address with CR/LF against a wildcard identity', async () => {
+    const wildcardIdentity = { id: 'id-wild', email: '*@example.com', mayDelete: true };
+    mock.method(client, 'getIdentities', async () => [wildcardIdentity]);
+
+    await assert.rejects(
+      () => client.createDraft({ subject: 'Hi', from: 'a@example.com\r\nBCC:x@example.com' }),
       (err: Error) => {
         assert.match(err.message, /not verified/i);
         return true;
@@ -373,6 +400,76 @@ describe('updateDraft', () => {
       },
     );
   });
+
+  // Body-extraction correctness (the `|| true` bug). Fixtures mirror real server shapes:
+  // a single-format draft aliases its one part into BOTH the textBody and htmlBody lists;
+  // a dual-format draft has two distinct typed parts. Assertions are on the recreate
+  // OUTPUT, whose bodyValues are re-keyed to 'text'/'html'.
+
+  it('preserves a single text-only body without synthesising a phantom html part', async () => {
+    const aliasedDraft = {
+      ...EXISTING_DRAFT,
+      textBody: [{ partId: '1', type: 'text/plain' }],
+      htmlBody: [{ partId: '1', type: 'text/plain' }], // server aliases the one part into both lists
+      bodyValues: { '1': { value: 'Plain only' } },
+    };
+    const makeReq = mock.method(client, 'makeRequest', async (req: any) => {
+      if (req.methodCalls[0][0] === 'Email/get') {
+        return { methodResponses: [['Email/get', { list: [aliasedDraft] }, 'getEmail']] };
+      }
+      return { methodResponses: [['Email/set', { created: { draft: { id: 'draft-2' } }, destroyed: ['draft-1'] }, 'updateDraft']] };
+    });
+
+    await client.updateDraft('draft-1', { subject: 'New subject' });
+
+    const emailObj = makeReq.mock.calls[1].arguments[0].methodCalls[0][1].create.draft;
+    assert.equal(emailObj.htmlBody, undefined);
+    assert.deepEqual(emailObj.bodyValues, { text: { value: 'Plain only' } });
+  });
+
+  it('preserves both bodies from their own parts on a subject-only edit', async () => {
+    const dualDraft = {
+      ...EXISTING_DRAFT,
+      textBody: [{ partId: '1', type: 'text/plain' }],
+      htmlBody: [{ partId: '2', type: 'text/html' }],
+      bodyValues: { '1': { value: 'The text' }, '2': { value: '<p>The html</p>' } },
+    };
+    const makeReq = mock.method(client, 'makeRequest', async (req: any) => {
+      if (req.methodCalls[0][0] === 'Email/get') {
+        return { methodResponses: [['Email/get', { list: [dualDraft] }, 'getEmail']] };
+      }
+      return { methodResponses: [['Email/set', { created: { draft: { id: 'draft-2' } }, destroyed: ['draft-1'] }, 'updateDraft']] };
+    });
+
+    await client.updateDraft('draft-1', { subject: 'New subject' });
+
+    const emailObj = makeReq.mock.calls[1].arguments[0].methodCalls[0][1].create.draft;
+    assert.deepEqual(emailObj.bodyValues, {
+      text: { value: 'The text' },
+      html: { value: '<p>The html</p>' },
+    });
+  });
+
+  it('updates only textBody and preserves the existing htmlBody', async () => {
+    const dualDraft = {
+      ...EXISTING_DRAFT,
+      textBody: [{ partId: '1', type: 'text/plain' }],
+      htmlBody: [{ partId: '2', type: 'text/html' }],
+      bodyValues: { '1': { value: 'The text' }, '2': { value: '<p>The html</p>' } },
+    };
+    const makeReq = mock.method(client, 'makeRequest', async (req: any) => {
+      if (req.methodCalls[0][0] === 'Email/get') {
+        return { methodResponses: [['Email/get', { list: [dualDraft] }, 'getEmail']] };
+      }
+      return { methodResponses: [['Email/set', { created: { draft: { id: 'draft-2' } }, destroyed: ['draft-1'] }, 'updateDraft']] };
+    });
+
+    await client.updateDraft('draft-1', { textBody: 'NEW text' });
+
+    const emailObj = makeReq.mock.calls[1].arguments[0].methodCalls[0][1].create.draft;
+    assert.equal(emailObj.bodyValues.text.value, 'NEW text');
+    assert.equal(emailObj.bodyValues.html.value, '<p>The html</p>');
+  });
 });
 
 // ---------- sendDraft ----------
@@ -508,7 +605,7 @@ describe('JMAP response validation', () => {
         ['error', { type: 'serverFail', description: 'oops' }, 'query'],
       ],
     });
-    // getEmails uses getListResult(response, 1) but only 1 response exists
+    // getEmails uses getQueryResult(response, 0, 1) and the error sits at index 0
     await assert.rejects(
       () => client.getEmails(undefined, 10),
       (err: Error) => {
@@ -549,8 +646,8 @@ describe('searchEmails', () => {
       ],
     });
     const results = await client.searchEmails('test', 10);
-    assert.equal(results.length, 1);
-    assert.equal(results[0].subject, 'Test');
+    assert.equal(results.items.length, 1);
+    assert.equal(results.items[0].subject, 'Test');
   });
 
   it('returns empty array when no results', async () => {
@@ -561,7 +658,7 @@ describe('searchEmails', () => {
       ],
     });
     const results = await client.searchEmails('nonexistent');
-    assert.deepEqual(results, []);
+    assert.deepEqual(results.items, []);
   });
 
   it('throws on JMAP error in query', async () => {
@@ -578,6 +675,32 @@ describe('searchEmails', () => {
         return true;
       },
     );
+  });
+
+  it('excludeDrafts adds notKeyword $draft to the server-side filter', async () => {
+    const makeReq = mock.method(client, 'makeRequest', async () => ({
+      methodResponses: [
+        ['Email/query', { ids: [] }, 'query'],
+        ['Email/get', { list: [] }, 'emails'],
+      ],
+    }));
+    await client.searchEmails('quarterly', 10, false, true);
+    const filter = makeReq.mock.calls[0].arguments[0].methodCalls[0][1].filter;
+    assert.equal(filter.text, 'quarterly');
+    assert.equal(filter.notKeyword, '$draft');
+  });
+
+  it('includes drafts by default (no notKeyword in the filter)', async () => {
+    const makeReq = mock.method(client, 'makeRequest', async () => ({
+      methodResponses: [
+        ['Email/query', { ids: [] }, 'query'],
+        ['Email/get', { list: [] }, 'emails'],
+      ],
+    }));
+    await client.searchEmails('quarterly', 10);
+    const filter = makeReq.mock.calls[0].arguments[0].methodCalls[0][1].filter;
+    assert.equal(filter.text, 'quarterly');
+    assert.equal(filter.notKeyword, undefined);
   });
 });
 
@@ -660,6 +783,41 @@ describe('validateSavePath', () => {
     const customDir = '/tmp/my-downloads';
     assert.throws(
       () => JmapClient.validateSavePath(`${customDir}/../../etc/shadow`, customDir),
+      (err: Error) => {
+        assert.match(err.message, /must be within/);
+        return true;
+      },
+    );
+  });
+
+  it('resolves a relative savePath against the download directory', () => {
+    const customDir = resolve('tmp', 'my-downloads');
+    const result = JmapClient.validateSavePath('report.pdf', customDir);
+    assert.equal(result, join(customDir, 'report.pdf'));
+  });
+
+  it('resolves a relative savePath with subdirectories against the download directory', () => {
+    const customDir = resolve('tmp', 'my-downloads');
+    const result = JmapClient.validateSavePath(join('thread', 'invoice.pdf'), customDir);
+    assert.equal(result, join(customDir, 'thread', 'invoice.pdf'));
+  });
+
+  it('rejects a relative savePath that traverses out of the download directory', () => {
+    const customDir = resolve('tmp', 'my-downloads');
+    assert.throws(
+      () => JmapClient.validateSavePath('../escape.pdf', customDir),
+      (err: Error) => {
+        assert.match(err.message, /must be within/);
+        return true;
+      },
+    );
+  });
+
+  it('rejects a Windows drive-absolute path outside the download directory', function () {
+    if (sep !== '\\') return; // drive-absolute semantics are win32-only
+    const customDir = resolve('C:\\Users\\me\\Downloads', 'fastmail-mcp');
+    assert.throws(
+      () => JmapClient.validateSavePath('C:\\Windows\\evil.exe', customDir),
       (err: Error) => {
         assert.match(err.message, /must be within/);
         return true;
@@ -1022,7 +1180,7 @@ describe('updateDraft wildcard identity', () => {
     await client.updateDraft('draft-1', { from: 'new@example.com' });
 
     const emailObj = makeReq.mock.calls[1].arguments[0].methodCalls[0][1].create.draft;
-    assert.deepEqual(emailObj.from, [{ email: 'new@example.com' }]);
+    assert.deepEqual(emailObj.from, [{ name: 'Una Wilde', email: 'new@example.com' }]);
   });
 
   it('preserves concrete from when updating without changing from', async () => {
@@ -1037,14 +1195,14 @@ describe('updateDraft wildcard identity', () => {
     await client.updateDraft('draft-1', { subject: 'Changed subject only' });
 
     const emailObj = makeReq.mock.calls[1].arguments[0].methodCalls[0][1].create.draft;
-    assert.deepEqual(emailObj.from, [{ email: 'work@example.com' }]);
+    assert.deepEqual(emailObj.from, [{ name: 'Una Wilde', email: 'work@example.com' }]);
   });
 });
 
 // ---------- version sync ----------
 
 describe('version sync', () => {
-  it('package.json, manifest.json, and index.ts all have the same version', async () => {
+  it('package.json, manifest.json, index.ts, and package-lock.json all have the same version', async () => {
     const { readFileSync } = await import('fs');
     const { resolve: r } = await import('path');
     const root = r(import.meta.dirname, '..');
@@ -1052,11 +1210,16 @@ describe('version sync', () => {
     const pkg = JSON.parse(readFileSync(r(root, 'package.json'), 'utf8'));
     const manifest = JSON.parse(readFileSync(r(root, 'manifest.json'), 'utf8'));
     const indexSrc = readFileSync(r(root, 'src', 'index.ts'), 'utf8');
+    const lock = JSON.parse(readFileSync(r(root, 'package-lock.json'), 'utf8'));
 
     const indexMatch = indexSrc.match(/version:\s*'([^']+)'/);
     assert.ok(indexMatch, 'Could not find version string in index.ts');
 
     assert.equal(pkg.version, manifest.version, 'package.json and manifest.json versions must match');
     assert.equal(pkg.version, indexMatch[1], 'package.json and index.ts versions must match');
+    // The lockfile carries the version in two places (root and the "" package
+    // entry); a bump that misses either would ship a mismatched .dxt.
+    assert.equal(pkg.version, lock.version, 'package.json and package-lock.json versions must match');
+    assert.equal(pkg.version, lock.packages['']?.version, 'package.json and package-lock.json root package versions must match');
   });
 });

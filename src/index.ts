@@ -8,15 +8,17 @@ import {
   McpError,
 } from '@modelcontextprotocol/sdk/types.js';
 import { FastmailAuth, FastmailConfig } from './auth.js';
-import { JmapClient } from './jmap-client.js';
+import { JmapClient, QueryResult } from './jmap-client.js';
 import { ContactsCalendarClient } from './contacts-calendar.js';
 import { CalDAVCalendarClient } from './caldav-client.js';
-import { coerceStringArray, coerceBool, redactBearerTokens } from './coerce.js';
+import { WebDAVFilesClient, filesAvailabilitySection } from './webdav-files-client.js';
+import { validateHttpsUrl } from './url-validation.js';
+import { coerceRecipients, coerceStringArray, coerceBool, redactBearerTokens, registerSecret } from './coerce.js';
 
 const server = new Server(
   {
     name: 'fastmail-mcp',
-    version: '1.11.0',
+    version: '1.13.4',
   },
   {
     capabilities: {
@@ -43,10 +45,6 @@ function findEnvValue(keys: string[]): { value?: string; key?: string; wasPlaceh
   return { value: undefined, key: undefined, wasPlaceholder: false };
 }
 
-function maskSecret(value: string): string {
-  if (value.length <= 6) return '***';
-  return `${value.slice(0, 4)}…${value.slice(-2)} (len ${value.length})`;
-}
 
 function getAuthConfig(): FastmailConfig {
   const tokenInfo = findEnvValue([
@@ -62,6 +60,9 @@ function getAuthConfig(): FastmailConfig {
       'FASTMAIL_API_TOKEN environment variable is required'
     );
   }
+  // Register for value-based redaction so an exact token occurrence in any
+  // error string is scrubbed even if it doesn't match the token-shape pattern.
+  registerSecret(apiToken);
 
   const baseInfo = findEnvValue([
     'FASTMAIL_BASE_URL',
@@ -71,10 +72,10 @@ function getAuthConfig(): FastmailConfig {
   ]);
 
   // Opt-in for self-hosted JMAP servers. Required to use any base URL outside
-  // the api.fastmail.com / www.fastmailusercontent.com allowlist.
+  // the api.fastmail.com / www.fastmailusercontent.com allowlist (which already
+  // covers Fastmail's regional hosts, e.g. phl.api.fastmail.com).
   const unsafeInfo = findEnvValue([
     'FASTMAIL_ALLOW_UNSAFE_BASE_URL',
-    'USER_CONFIG_FASTMAIL_ALLOW_UNSAFE_BASE_URL',
   ]);
   const allowUnsafeBaseUrl = unsafeInfo.value === 'true' || unsafeInfo.value === '1';
 
@@ -107,16 +108,61 @@ function initializeCalDAVClient(): CalDAVCalendarClient | null {
   const username = findEnvValue([
     'FASTMAIL_CALDAV_USERNAME',
     'USER_CONFIG_FASTMAIL_CALDAV_USERNAME',
+    'USER_CONFIG_fastmail_caldav_username',
+    'fastmail_caldav_username',
   ]).value;
   const password = findEnvValue([
     'FASTMAIL_CALDAV_PASSWORD',
     'USER_CONFIG_FASTMAIL_CALDAV_PASSWORD',
+    'USER_CONFIG_fastmail_caldav_password',
+    'fastmail_caldav_password',
   ]).value;
 
   if (!username || !password) return null;
 
+  // Register the CalDAV password (and username) for value-based redaction —
+  // Basic-auth credentials aren't covered by the token-shape patterns.
+  registerSecret(password);
+  registerSecret(username);
+
   caldavClient = new CalDAVCalendarClient({ username, password });
   return caldavClient;
+}
+
+let webdavClient: WebDAVFilesClient | null = null;
+
+function initializeWebDAVClient(): WebDAVFilesClient | null {
+  if (webdavClient) return webdavClient;
+
+  const baseUrl = findEnvValue([
+    'FASTMAIL_WEBDAV_URL',
+    'USER_CONFIG_FASTMAIL_WEBDAV_URL',
+    'USER_CONFIG_fastmail_webdav_url',
+    'fastmail_webdav_url',
+  ]).value;
+  const username = findEnvValue([
+    'FASTMAIL_WEBDAV_USERNAME',
+    'USER_CONFIG_FASTMAIL_WEBDAV_USERNAME',
+    'USER_CONFIG_fastmail_webdav_username',
+    'fastmail_webdav_username',
+  ]).value;
+  const password = findEnvValue([
+    'FASTMAIL_WEBDAV_PASSWORD',
+    'USER_CONFIG_FASTMAIL_WEBDAV_PASSWORD',
+    'USER_CONFIG_fastmail_webdav_password',
+    'fastmail_webdav_password',
+  ]).value;
+
+  if (!baseUrl || !username || !password) return null;
+
+  // The base URL is server config, never a tool argument — tools may only
+  // supply relative paths beneath it. HTTPS-only, no embedded credentials.
+  validateHttpsUrl(baseUrl, 'FASTMAIL_WEBDAV_URL');
+  registerSecret(password);
+  registerSecret(username);
+
+  webdavClient = new WebDAVFilesClient({ baseUrl, username, password });
+  return webdavClient;
 }
 
 function getDownloadDir(): string | undefined {
@@ -126,6 +172,26 @@ function getDownloadDir(): string | undefined {
     'USER_CONFIG_fastmail_download_dir',
     'fastmail_download_dir',
   ]).value;
+}
+
+// Clamp a caller-supplied limit into [1, max], tolerating string and NaN input
+// (a lenient client may send "20", and a bare Number("abc") would yield NaN →
+// an unbounded/negative JMAP query).
+function clampLimit(value: unknown, fallback: number, max: number): number {
+  return Math.min(Math.max(Number(value) || fallback, 1), max);
+}
+
+// When the JMAP server reports a total match count (calculateTotal: true), wrap
+// the items in a { total, items } envelope so callers can tell a truncated page
+// from a complete result. Without a total the bare array is returned unchanged,
+// keeping output byte-identical for paths that never had one (CalDAV, contacts
+// fallback).
+function formatQueryResult(result: QueryResult): string {
+  const { items, total } = result;
+  if (total != null) {
+    return JSON.stringify({ total, items }, null, 2);
+  }
+  return JSON.stringify(items, null, 2);
 }
 
 server.setRequestHandler(ListToolsRequestSchema, async () => {
@@ -183,7 +249,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: 'list_emails',
-        description: 'List emails from a mailbox',
+        description: 'List emails from a mailbox. When the server reports a total match count, results are wrapped in a {"total", "items"} JSON envelope; otherwise a bare JSON array is returned.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -205,7 +271,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: 'list_emails_metadata',
-        description: 'Same as list_emails (lists emails from a mailbox, optionally filtered by mailboxId, with paging and sort) but returns ONLY metadata fields on each result — id, threadId, subject, from, to, replyTo, receivedAt, hasAttachment, keywords. Does NOT return preview or any body-derived content. Use in privacy-sensitive flows where the workflow needs only the envelope (e.g. customer-mail least-privilege scans, or any caller forbidden from ingesting message bodies). Pair with get_email_metadata for follow-up lookups that should also stay header-only.',
+        description: 'Same as list_emails (lists emails from a mailbox, optionally filtered by mailboxId, with paging and sort) but returns ONLY metadata fields on each result — id, threadId, subject, from, to, replyTo, receivedAt, hasAttachment, keywords. Does NOT return preview or any body-derived content. Use in privacy-sensitive flows where the workflow needs only the envelope (e.g. customer-mail least-privilege scans, or any caller forbidden from ingesting message bodies). Pair with get_email_metadata for follow-up lookups that should also stay header-only. When the server reports a total match count, results are wrapped in a {"total", "items"} JSON envelope; otherwise a bare JSON array is returned.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -323,6 +389,21 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               items: { type: 'string' },
               description: 'Reply-To email addresses (replies go here instead of to the sender)',
             },
+            attachments: {
+              type: 'array',
+              description: 'Files to attach. Each entry must use EXACTLY ONE source: localPath (a file inside the configured download directory), emailId + attachmentId (re-attach an attachment from an existing email — no bytes are copied), or blobId (an already-uploaded JMAP blob). Optional name/type override the inferred filename and MIME type.',
+              items: {
+                type: 'object',
+                properties: {
+                  localPath: { type: 'string', description: 'Path to a file within FASTMAIL_DOWNLOAD_DIR (relative paths resolve against it)' },
+                  emailId: { type: 'string', description: 'Source email ID (use with attachmentId)' },
+                  attachmentId: { type: 'string', description: 'Attachment partId, blobId, or zero-based index within the source email' },
+                  blobId: { type: 'string', description: 'An existing blob ID in this account' },
+                  name: { type: 'string', description: 'Override the attachment filename' },
+                  type: { type: 'string', description: 'Override the MIME type' },
+                },
+              },
+            },
           },
           required: ['to', 'subject'],
         },
@@ -372,6 +453,21 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: 'array',
               items: { type: 'string' },
               description: 'Reply-To email addresses (replies go here instead of to the sender)',
+            },
+            attachments: {
+              type: 'array',
+              description: 'Files to attach. Each entry must use EXACTLY ONE source: localPath (a file inside the configured download directory), emailId + attachmentId (re-attach an attachment from an existing email — no bytes are copied), or blobId (an already-uploaded JMAP blob). Optional name/type override the inferred filename and MIME type.',
+              items: {
+                type: 'object',
+                properties: {
+                  localPath: { type: 'string', description: 'Path to a file within FASTMAIL_DOWNLOAD_DIR (relative paths resolve against it)' },
+                  emailId: { type: 'string', description: 'Source email ID (use with attachmentId)' },
+                  attachmentId: { type: 'string', description: 'Attachment partId, blobId, or zero-based index within the source email' },
+                  blobId: { type: 'string', description: 'An existing blob ID in this account' },
+                  name: { type: 'string', description: 'Override the attachment filename' },
+                  type: { type: 'string', description: 'Override the MIME type' },
+                },
+              },
             },
           },
           required: ['originalEmailId'],
@@ -433,6 +529,21 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               items: { type: 'string' },
               description: 'Reply-To email addresses (replies go here instead of to the sender)',
             },
+            attachments: {
+              type: 'array',
+              description: 'Files to attach. Each entry must use EXACTLY ONE source: localPath (a file inside the configured download directory), emailId + attachmentId (re-attach an attachment from an existing email — no bytes are copied), or blobId (an already-uploaded JMAP blob). Optional name/type override the inferred filename and MIME type.',
+              items: {
+                type: 'object',
+                properties: {
+                  localPath: { type: 'string', description: 'Path to a file within FASTMAIL_DOWNLOAD_DIR (relative paths resolve against it)' },
+                  emailId: { type: 'string', description: 'Source email ID (use with attachmentId)' },
+                  attachmentId: { type: 'string', description: 'Attachment partId, blobId, or zero-based index within the source email' },
+                  blobId: { type: 'string', description: 'An existing blob ID in this account' },
+                  name: { type: 'string', description: 'Override the attachment filename' },
+                  type: { type: 'string', description: 'Override the MIME type' },
+                },
+              },
+            },
           },
         },
       },
@@ -482,6 +593,21 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               items: { type: 'string' },
               description: 'Reply-To email addresses (replies go here instead of to the sender)',
             },
+            attachments: {
+              type: 'array',
+              description: 'Files to attach. Each entry must use EXACTLY ONE source: localPath (a file inside the configured download directory), emailId + attachmentId (re-attach an attachment from an existing email — no bytes are copied), or blobId (an already-uploaded JMAP blob). Optional name/type override the inferred filename and MIME type.',
+              items: {
+                type: 'object',
+                properties: {
+                  localPath: { type: 'string', description: 'Path to a file within FASTMAIL_DOWNLOAD_DIR (relative paths resolve against it)' },
+                  emailId: { type: 'string', description: 'Source email ID (use with attachmentId)' },
+                  attachmentId: { type: 'string', description: 'Attachment partId, blobId, or zero-based index within the source email' },
+                  blobId: { type: 'string', description: 'An existing blob ID in this account' },
+                  name: { type: 'string', description: 'Override the attachment filename' },
+                  type: { type: 'string', description: 'Override the MIME type' },
+                },
+              },
+            },
           },
           required: ['emailId'],
         },
@@ -502,13 +628,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: 'search_emails',
-        description: 'Search emails by subject or content',
+        description:
+          'Full-text search of email body and subject. Does not filter by sender, recipient, or date — use advanced_search for field-specific filtering. Drafts are included by default; set excludeDrafts=true to omit draft messages from results. When the server reports a total match count, results are wrapped in a {"total", "items"} JSON envelope; otherwise a bare JSON array is returned.',
         inputSchema: {
           type: 'object',
           properties: {
             query: {
               type: 'string',
-              description: 'Search query string',
+              description: 'Text to search for in email body and subject lines',
             },
             limit: {
               type: ['number', 'string'],
@@ -519,13 +646,17 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: 'boolean',
               description: 'Sort oldest first instead of newest first (default: false)',
             },
+            excludeDrafts: {
+              type: 'boolean',
+              description: 'Omit draft messages from results (default: false, drafts included). Filtered server-side via the $draft keyword.',
+            },
           },
           required: ['query'],
         },
       },
       {
         name: 'search_emails_metadata',
-        description: 'Same as search_emails (free-text search across subject and body) but returns ONLY metadata on each match — id, threadId, subject, from, to, replyTo, receivedAt, hasAttachment, keywords. The query still searches body text on the server side; only the result envelopes come back, never preview or body excerpts. Use when a content match is required (e.g. "find all messages mentioning X") but the matches must not surface body fragments to the caller.',
+        description: 'Same as search_emails (free-text search across subject and body) but returns ONLY metadata on each match — id, threadId, subject, from, to, replyTo, receivedAt, hasAttachment, keywords. The query still searches body text on the server side; only the result envelopes come back, never preview or body excerpts. Use when a content match is required (e.g. "find all messages mentioning X") but the matches must not surface body fragments to the caller. When the server reports a total match count, results are wrapped in a {"total", "items"} JSON envelope; otherwise a bare JSON array is returned.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -548,7 +679,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: 'list_contacts',
-        description: 'List contacts from the address book',
+        description: 'List contacts from the address book. When the server reports a total match count, results are wrapped in a {"total", "items"} JSON envelope; otherwise a bare JSON array is returned.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -576,7 +707,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: 'search_contacts',
-        description: 'Search contacts by name or email',
+        description: 'Search contacts by name or email. When the server reports a total match count, results are wrapped in a {"total", "items"} JSON envelope; otherwise a bare JSON array is returned.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -591,6 +722,132 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
           },
           required: ['query'],
+        },
+      },
+      {
+        name: 'create_contact',
+        description: 'Create a new contact in the address book. Requires a name or at least one email address. Requires an API token with read-write contacts scope.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            name: {
+              type: 'object',
+              description: 'Structured name; provide full and/or given/surname',
+              properties: {
+                given: { type: 'string' },
+                surname: { type: 'string' },
+                full: { type: 'string', description: 'Full display name' },
+              },
+            },
+            emails: {
+              type: 'array',
+              description: 'Email addresses (replaces ALL existing emails on update; [] clears)',
+              items: {
+                type: 'object',
+                properties: {
+                  address: { type: 'string' },
+                  label: { type: 'string', description: 'Optional label, e.g. work / home' },
+                },
+                required: ['address'],
+              },
+            },
+            phones: {
+              type: 'array',
+              description: 'Phone numbers (replaces ALL existing phones on update)',
+              items: {
+                type: 'object',
+                properties: {
+                  number: { type: 'string' },
+                  label: { type: 'string' },
+                },
+                required: ['number'],
+              },
+            },
+            addresses: {
+              type: 'array',
+              description: 'Postal addresses as free-form text (replaces ALL existing on update)',
+              items: {
+                type: 'object',
+                properties: {
+                  full: { type: 'string', description: 'Full address as one string' },
+                  label: { type: 'string' },
+                },
+                required: ['full'],
+              },
+            },
+            notes: { type: 'string', description: 'Free-form note (replaces the existing note on update)' },
+            addressBookId: { type: 'string', description: 'Target address book id (default book when omitted)' },
+          },
+        },
+      },
+      {
+        name: 'update_contact',
+        description: 'Update an existing contact. Each provided field WHOLLY REPLACES the stored value (e.g. emails: [] removes all emails) — unspecified fields are left untouched. Requires read-write contacts scope.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            contactId: { type: 'string', description: 'ID of the contact to update' },
+            name: {
+              type: 'object',
+              description: 'Structured name; provide full and/or given/surname',
+              properties: {
+                given: { type: 'string' },
+                surname: { type: 'string' },
+                full: { type: 'string', description: 'Full display name' },
+              },
+            },
+            emails: {
+              type: 'array',
+              description: 'Email addresses (replaces ALL existing emails on update; [] clears)',
+              items: {
+                type: 'object',
+                properties: {
+                  address: { type: 'string' },
+                  label: { type: 'string', description: 'Optional label, e.g. work / home' },
+                },
+                required: ['address'],
+              },
+            },
+            phones: {
+              type: 'array',
+              description: 'Phone numbers (replaces ALL existing phones on update)',
+              items: {
+                type: 'object',
+                properties: {
+                  number: { type: 'string' },
+                  label: { type: 'string' },
+                },
+                required: ['number'],
+              },
+            },
+            addresses: {
+              type: 'array',
+              description: 'Postal addresses as free-form text (replaces ALL existing on update)',
+              items: {
+                type: 'object',
+                properties: {
+                  full: { type: 'string', description: 'Full address as one string' },
+                  label: { type: 'string' },
+                },
+                required: ['full'],
+              },
+            },
+            notes: { type: 'string', description: 'Free-form note (replaces the existing note on update)' },
+            expectState: { type: 'string', description: 'Optional JMAP state precondition (ifInState); update fails with stateMismatch if contacts changed since this state' },
+          },
+          required: ['contactId'],
+        },
+      },
+      {
+        name: 'delete_contact',
+        description: 'Permanently delete a contact from the address book. This cannot be undone. Requires read-write contacts scope.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            contactId: { type: 'string', description: 'ID of the contact to delete' },
+            expectState: { type: 'string', description: 'Optional JMAP state precondition (ifInState)' },
+          },
+          required: ['contactId'],
         },
       },
       {
@@ -629,7 +886,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: 'get_calendar_event',
-        description: 'Get a specific calendar event by ID',
+        description: 'Get a specific calendar event by ID. Returns organizer and participants when available.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -643,7 +900,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: 'create_calendar_event',
-        description: 'Create a new calendar event',
+        description: 'Create a new calendar event. Supports date-only (e.g. 2026-04-01) for all-day events. DTEND is exclusive per RFC 5545 — a one-day event on April 1 needs end: 2026-04-02.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -661,11 +918,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             start: {
               type: 'string',
-              description: 'Start time in ISO 8601 format',
+              description: 'Start time in ISO 8601 format (e.g. 2026-04-07T14:00:00Z) or date-only for all-day events (e.g. 2026-04-07)',
             },
             end: {
               type: 'string',
-              description: 'End time in ISO 8601 format',
+              description: 'End time in ISO 8601 format. For all-day events, DTEND is exclusive — a one-day event on April 1 requires end: 2026-04-02',
             },
             location: {
               type: 'string',
@@ -676,14 +933,84 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               items: {
                 type: 'object',
                 properties: {
-                  email: { type: 'string' },
-                  name: { type: 'string' }
-                }
+                  email: { type: 'string', description: 'Participant email address' },
+                  name: { type: 'string', description: 'Participant display name (optional)' }
+                },
+                required: ['email'],
               },
-              description: 'Event participants (optional)',
+              description: 'Event participants (optional). Automatically adds ORGANIZER from CalDAV username.',
             },
           },
           required: ['calendarId', 'title', 'start', 'end'],
+        },
+      },
+      {
+        name: 'update_calendar_event',
+        description: 'Update an existing calendar event. Preserves all existing data (attendees, reminders, recurrence rules, etc.) not being changed. Omit a field to leave it unchanged; passing an empty/whitespace string for title, description, or location is rejected (use clearFields to delete description/location). Floating times preserve the original timezone; explicit UTC/offset times convert to UTC. WARNING: providing participants replaces ALL existing attendee data (acceptance status, roles, etc.). participants: [] removes all attendees.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            eventId: {
+              type: 'string',
+              description: 'ID of the event to update',
+            },
+            title: {
+              type: 'string',
+              description: 'New event title',
+            },
+            description: {
+              type: 'string',
+              description: 'New event description',
+            },
+            start: {
+              type: 'string',
+              description: 'New start time in ISO 8601 format. Floating times (no Z/offset) preserve original timezone',
+            },
+            end: {
+              type: 'string',
+              description: 'New end time in ISO 8601 format. DTEND is exclusive per RFC 5545',
+            },
+            location: {
+              type: 'string',
+              description: 'New event location',
+            },
+            participants: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  email: { type: 'string', description: 'Participant email address' },
+                  name: { type: 'string', description: 'Participant display name (optional)' }
+                },
+                required: ['email'],
+              },
+              description: 'Replaces ALL existing attendees. Empty array removes all attendees. Omit to preserve existing attendees.',
+            },
+            clearFields: {
+              type: 'array',
+              items: { type: 'string', enum: ['description', 'location'] },
+              description: 'Property names to delete from the event. Allowed: description, location. Cannot also pass the same field as a value.',
+            },
+            confirmRecurring: {
+              type: 'boolean',
+              description: 'Required when changing start/end on a recurring event with exceptions. Acknowledges that orphaned exception overrides will be removed.',
+            },
+          },
+          required: ['eventId'],
+        },
+      },
+      {
+        name: 'delete_calendar_event',
+        description: 'Delete a calendar event by ID',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            eventId: {
+              type: 'string',
+              description: 'ID of the event to delete',
+            },
+          },
+          required: ['eventId'],
         },
       },
       {
@@ -696,7 +1023,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: 'get_recent_emails',
-        description: 'Get the most recent emails from inbox (like top-ten)',
+        description: 'Get the most recent emails across all mailboxes except Trash and Spam (pass mailboxName to scope to one folder, e.g. "inbox"). When the server reports a total match count, results are wrapped in a {"total", "items"} JSON envelope; otherwise a bare JSON array is returned.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -707,8 +1034,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             mailboxName: {
               type: 'string',
-              description: 'Mailbox to search (default: inbox)',
-              default: 'inbox',
+              description: 'Mailbox to search (optional; when omitted, all mailboxes except Trash and Spam are searched)',
             },
             ascending: {
               type: 'boolean',
@@ -873,15 +1199,45 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             savePath: {
               type: 'string',
-              description: `File path to save the attachment to. Paths are restricted to ${getDownloadDir() || '~/Downloads/fastmail-mcp/'} (configurable via FASTMAIL_DOWNLOAD_DIR). Path traversal outside this directory is rejected for security. Parent directories will be created automatically.`,
+              description: `File path to save the attachment to. May be absolute or relative; relative paths resolve against ${getDownloadDir() || '~/Downloads/fastmail-mcp/'} (configurable via FASTMAIL_DOWNLOAD_DIR), so a bare filename lands there in one step. Absolute paths must fall within that directory; traversal or symlink escape outside it is rejected for security. To save directly into your own location, set FASTMAIL_DOWNLOAD_DIR to that root. Parent directories will be created automatically.`,
             },
           },
           required: ['emailId', 'attachmentId'],
         },
       },
       {
+        name: 'save_attachment_to_webdav',
+        description: 'Save an email attachment directly to WebDAV cloud storage (e.g. Fastmail Files or Nextcloud) without touching local disk. The storage server and credentials come from server configuration (FASTMAIL_WEBDAV_URL / _USERNAME / _PASSWORD); this tool only chooses the relative path beneath that base. Fails if the remote file exists unless overwrite is set.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            emailId: {
+              type: 'string',
+              description: 'ID of the email',
+            },
+            attachmentId: {
+              type: 'string',
+              description: 'Attachment partId, blobId, or zero-based index',
+            },
+            remotePath: {
+              type: 'string',
+              description: 'Relative path under the configured WebDAV base (e.g. "invoices/2026/receipt.pdf"). No leading slash, no "..", forward slashes only. Missing parent folders are created unless createParents is false.',
+            },
+            overwrite: {
+              type: 'boolean',
+              description: 'Replace an existing remote file (default false: fail if it exists)',
+            },
+            createParents: {
+              type: 'boolean',
+              description: 'Create missing parent collections via MKCOL (default true)',
+            },
+          },
+          required: ['emailId', 'attachmentId', 'remotePath'],
+        },
+      },
+      {
         name: 'advanced_search',
-        description: 'Advanced email search with multiple criteria. Mailbox scoping supports a single mailbox (mailboxId), an intersection of multiple mailboxes (requiredMailboxIds — must be a member of ALL listed mailboxes), and exclusion (excludeMailboxIds — member of NONE of the listed mailboxes), alongside the standard sender / recipient / subject / free-text / date / attachment / unread / pinned filters.',
+        description: 'Advanced email search with multiple criteria. Mailbox scoping supports a single mailbox (mailboxId), an intersection of multiple mailboxes (requiredMailboxIds — must be a member of ALL listed mailboxes), and exclusion (excludeMailboxIds — member of NONE of the listed mailboxes), alongside the standard sender / recipient / subject / free-text / date / attachment / unread / pinned filters. When the server reports a total match count, results are wrapped in a {"total", "items"} JSON envelope; otherwise a bare JSON array is returned.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -949,7 +1305,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: 'advanced_search_metadata',
-        description: 'Same filter capabilities as advanced_search (single-mailbox scoping via mailboxId, multi-mailbox intersection via requiredMailboxIds, exclusion via excludeMailboxIds, plus sender / recipient / subject / free text / date / attachment / unread / pinned) but returns ONLY metadata on each match — id, threadId, subject, from, to, cc, replyTo, receivedAt, hasAttachment, keywords. Does NOT return preview or any body-derived content. Use in privacy-sensitive flows where the routing decision is made from headers alone — for example, when classifying customer mail by sender / recipient / subject / thread state without ingesting body content. The free-text query still searches body content on the server side; only the result envelope comes back without body excerpts.',
+        description: 'Same filter capabilities as advanced_search (single-mailbox scoping via mailboxId, multi-mailbox intersection via requiredMailboxIds, exclusion via excludeMailboxIds, plus sender / recipient / subject / free text / date / attachment / unread / pinned) but returns ONLY metadata on each match — id, threadId, subject, from, to, cc, replyTo, receivedAt, hasAttachment, keywords. Does NOT return preview or any body-derived content. Use in privacy-sensitive flows where the routing decision is made from headers alone — for example, when classifying customer mail by sender / recipient / subject / thread state without ingesting body content. The free-text query still searches body content on the server side; only the result envelope comes back without body excerpts. When the server reports a total match count, results are wrapped in a {"total", "items"} JSON envelope; otherwise a bare JSON array is returned.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -1017,13 +1373,17 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: 'get_thread',
-        description: 'Get all emails in a conversation thread',
+        description: 'Get all emails in a conversation thread. Draft messages are excluded by default; set includeDrafts=true to include in-progress drafts in the thread.',
         inputSchema: {
           type: 'object',
           properties: {
             threadId: {
               type: 'string',
               description: 'ID of the thread/conversation',
+            },
+            includeDrafts: {
+              type: 'boolean',
+              description: 'Include draft messages in the thread (default: false, drafts excluded).',
             },
           },
           required: ['threadId'],
@@ -1180,7 +1540,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: 'check_function_availability',
-        description: 'Check which MCP functions are available based on account permissions',
+        description: 'Check which MCP functions are available based on account permissions. Calendar tools run over CalDAV, so calendar is reported available when CalDAV credentials are configured, regardless of the JMAP calendar capability.',
         inputSchema: {
           type: 'object',
           properties: {},
@@ -1275,12 +1635,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case 'list_emails': {
         const { mailboxId, limit, ascending } = args as any;
         const validLimit = Math.min(Math.max(Number(limit) || 20, 1), 100);
-        const emails = await client.getEmails(mailboxId, validLimit, !!ascending);
+        const result = await client.getEmails(mailboxId, validLimit, !!ascending);
         return {
           content: [
             {
               type: 'text',
-              text: JSON.stringify(emails, null, 2),
+              text: formatQueryResult(result),
             },
           ],
         };
@@ -1289,12 +1649,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case 'list_emails_metadata': {
         const { mailboxId, limit, ascending } = (args ?? {}) as any;
         const validLimit = Math.min(Math.max(Number(limit) || 20, 1), 100);
-        const emails = await client.getEmailsMetadata(mailboxId, validLimit, !!ascending);
+        const result = await client.getEmailsMetadata(mailboxId, validLimit, !!ascending);
         return {
           content: [
             {
               type: 'text',
-              text: JSON.stringify(emails, null, 2),
+              text: formatQueryResult(result),
             },
           ],
         };
@@ -1333,8 +1693,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'send_email': {
-        const { to, cc, bcc, from, mailboxId, subject, textBody, htmlBody, inReplyTo, references, replyTo } = args as any;
-        const toArray = coerceStringArray(to);
+        const { from, mailboxId, subject, textBody, htmlBody, inReplyTo, references } = args as any;
+        const { to: toArray, cc, bcc, replyTo } = coerceRecipients(args as any);
         if (!toArray || toArray.length === 0) {
           throw new McpError(ErrorCode.InvalidParams, 'to field is required and must be a non-empty array');
         }
@@ -1354,9 +1714,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           subject,
           textBody,
           htmlBody,
-          inReplyTo,
-          references,
+          // Coerce so a lenient client's stringified array doesn't reach the JMAP
+          // Email object as a bare string (consistent with the recipient fields).
+          inReplyTo: coerceStringArray(inReplyTo),
+          references: coerceStringArray(references),
           replyTo,
+          attachments: (args as any).attachments,
+          downloadDir: getDownloadDir(),
         });
 
         return {
@@ -1370,7 +1734,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'reply_email': {
-        const { originalEmailId, to, cc, bcc, from, textBody, htmlBody, send, replyTo } = args as any;
+        const { originalEmailId, from, textBody, htmlBody, send } = args as any;
+        const { to: toArray, cc, bcc, replyTo } = coerceRecipients(args as any);
         const shouldSend = coerceBool(send) ?? true;
         if (!originalEmailId) {
           throw new McpError(ErrorCode.InvalidParams, 'originalEmailId is required');
@@ -1401,7 +1766,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
 
         // Default recipients to the original sender
-        const toArray = coerceStringArray(to);
         const replyRecipients = (toArray && toArray.length > 0)
           ? toArray
           : (Array.isArray(originalEmail.from) ? originalEmail.from.map((addr: any) => addr.email).filter(Boolean) : []);
@@ -1421,6 +1785,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           inReplyTo: inReplyToHeader,
           references: referencesHeader,
           replyTo,
+          attachments: (args as any).attachments,
+          downloadDir: getDownloadDir(),
         };
 
         if (!shouldSend) {
@@ -1448,7 +1814,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'create_draft': {
-        const { to, cc, bcc, from, mailboxId, subject, textBody, htmlBody, inReplyTo, references, replyTo } = args as any;
+        const { from, mailboxId, subject, textBody, htmlBody, inReplyTo, references } = args as any;
+        const { to, cc, bcc, replyTo } = coerceRecipients(args as any);
 
         if (!to?.length && !subject && !textBody && !htmlBody) {
           throw new McpError(ErrorCode.InvalidParams, 'At least one of to, subject, textBody, or htmlBody must be provided');
@@ -1463,9 +1830,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           subject,
           textBody,
           htmlBody,
-          inReplyTo,
-          references,
+          inReplyTo: coerceStringArray(inReplyTo),
+          references: coerceStringArray(references),
           replyTo,
+          attachments: (args as any).attachments,
+          downloadDir: getDownloadDir(),
         });
 
         const summary = [
@@ -1486,7 +1855,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'edit_draft': {
-        const { emailId, to, cc, bcc, from, subject, textBody, htmlBody, replyTo } = args as any;
+        const { emailId, from, subject, textBody, htmlBody } = args as any;
+        const { to, cc, bcc, replyTo } = coerceRecipients(args as any);
         if (!emailId) {
           throw new McpError(ErrorCode.InvalidParams, 'emailId is required');
         }
@@ -1500,6 +1870,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           textBody,
           htmlBody,
           replyTo,
+          attachments: (args as any).attachments,
+          downloadDir: getDownloadDir(),
         });
 
         return {
@@ -1531,17 +1903,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'search_emails': {
-        const { query, limit, ascending } = args as any;
+        const { query, limit, ascending, excludeDrafts } = args as any;
         if (!query) {
           throw new McpError(ErrorCode.InvalidParams, 'query is required');
         }
         const validLimit = Math.min(Math.max(Number(limit) || 20, 1), 100);
-        const emails = await client.searchEmails(query, validLimit, !!ascending);
+        const result = await client.searchEmails(query, validLimit, !!ascending, coerceBool(excludeDrafts) ?? false);
         return {
           content: [
             {
               type: 'text',
-              text: JSON.stringify(emails, null, 2),
+              text: formatQueryResult(result),
             },
           ],
         };
@@ -1553,26 +1925,26 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           throw new McpError(ErrorCode.InvalidParams, 'query is required');
         }
         const validLimit = Math.min(Math.max(Number(limit) || 20, 1), 100);
-        const emails = await client.searchEmailsMetadata(query, validLimit, !!ascending);
+        const result = await client.searchEmailsMetadata(query, validLimit, !!ascending);
         return {
           content: [
             {
               type: 'text',
-              text: JSON.stringify(emails, null, 2),
+              text: formatQueryResult(result),
             },
           ],
         };
       }
 
       case 'list_contacts': {
-        const { limit = 50 } = args as any;
+        const { limit } = args as any;
         const contactsClient = initializeContactsCalendarClient();
-        const contacts = await contactsClient.getContacts(limit);
+        const result = await contactsClient.getContacts(clampLimit(limit, 50, 200));
         return {
           content: [
             {
               type: 'text',
-              text: JSON.stringify(contacts, null, 2),
+              text: formatQueryResult(result),
             },
           ],
         };
@@ -1596,52 +1968,98 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'search_contacts': {
-        const { query, limit = 20 } = args as any;
+        const { query, limit } = args as any;
         if (!query) {
           throw new McpError(ErrorCode.InvalidParams, 'query is required');
         }
         const contactsClient = initializeContactsCalendarClient();
-        const contacts = await contactsClient.searchContacts(query, limit);
+        const result = await contactsClient.searchContacts(query, clampLimit(limit, 20, 100));
         return {
           content: [
             {
               type: 'text',
-              text: JSON.stringify(contacts, null, 2),
+              text: formatQueryResult(result),
+            },
+          ],
+        };
+      }
+
+      // Calendar operations use CalDAV directly.
+      // JMAP Calendars: spec not yet finalized, Fastmail has not enabled JMAP calendar support.
+      // Existing JMAP calendar code in contacts-calendar.ts has known bugs and must not be used.
+      // When Fastmail enables JMAP calendars: re-enable the path, fix to match finalized spec,
+      // do a parity pass with CalDAV implementation, and test against live Fastmail.
+      // CalDAV tests should be structured so they can serve as a basis for JMAP tests later.
+
+      case 'create_contact': {
+        const { name, emails, phones, addresses, notes, addressBookId } = args as any;
+        const contactsClient = initializeContactsCalendarClient();
+        const contactId = await contactsClient.createContact({ name, emails, phones, addresses, notes, addressBookId });
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Contact created successfully. Contact ID: ${contactId}`,
+            },
+          ],
+        };
+      }
+
+      case 'update_contact': {
+        const { contactId, name, emails, phones, addresses, notes, expectState } = args as any;
+        if (!contactId) {
+          throw new McpError(ErrorCode.InvalidParams, 'contactId is required');
+        }
+        const contactsClient = initializeContactsCalendarClient();
+        await contactsClient.updateContact(contactId, { name, emails, phones, addresses, notes, expectState });
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Contact updated successfully. Contact ID: ${contactId}`,
+            },
+          ],
+        };
+      }
+
+      case 'delete_contact': {
+        const { contactId, expectState } = args as any;
+        if (!contactId) {
+          throw new McpError(ErrorCode.InvalidParams, 'contactId is required');
+        }
+        const contactsClient = initializeContactsCalendarClient();
+        await contactsClient.deleteContact(contactId, expectState);
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Contact deleted. Contact ID: ${contactId}`,
             },
           ],
         };
       }
 
       case 'list_calendars': {
-        try {
-          const contactsClient = initializeContactsCalendarClient();
-          const calendars = await contactsClient.getCalendars();
-          return { content: [{ type: 'text', text: JSON.stringify(calendars, null, 2) }] };
-        } catch {
-          // JMAP calendars not available, try CalDAV
-          const davClient = initializeCalDAVClient();
-          if (!davClient) {
-            throw new McpError(ErrorCode.InvalidRequest, 'JMAP calendars not available and CalDAV not configured. Set FASTMAIL_CALDAV_USERNAME and FASTMAIL_CALDAV_PASSWORD to use CalDAV.');
-          }
-          const calendars = await davClient.getCalendars();
-          return { content: [{ type: 'text', text: JSON.stringify(calendars, null, 2) }] };
+        const davClient = initializeCalDAVClient();
+        if (!davClient) {
+          throw new McpError(ErrorCode.InvalidRequest, 'CalDAV not configured. Set FASTMAIL_CALDAV_USERNAME and FASTMAIL_CALDAV_PASSWORD.');
         }
+        const calendars = await davClient.getCalendars();
+        return { content: [{ type: 'text', text: JSON.stringify(calendars, null, 2) }] };
       }
 
       case 'list_calendar_events': {
-        const { calendarId, limit = 50, startDate, endDate } = args as any;
-        try {
-          const contactsClient = initializeContactsCalendarClient();
-          const events = await contactsClient.getCalendarEvents(calendarId, limit);
-          return { content: [{ type: 'text', text: JSON.stringify(events, null, 2) }] };
-        } catch {
-          const davClient = initializeCalDAVClient();
-          if (!davClient) {
-            throw new McpError(ErrorCode.InvalidRequest, 'JMAP calendars not available and CalDAV not configured. Set FASTMAIL_CALDAV_USERNAME and FASTMAIL_CALDAV_PASSWORD to use CalDAV.');
-          }
-          const events = await davClient.getCalendarEvents(calendarId, limit, startDate, endDate);
-          return { content: [{ type: 'text', text: JSON.stringify(events, null, 2) }] };
+        const { calendarId, limit, startDate, endDate } = args as any;
+        // JMAP Calendars: disabled — spec not yet finalized, Fastmail has not enabled support.
+        // Existing JMAP calendar code in contacts-calendar.ts has known bugs.
+        // When Fastmail enables JMAP calendars: re-enable, fix to match finalized spec,
+        // do a parity pass with CalDAV implementation, and test against live Fastmail.
+        const davClient = initializeCalDAVClient();
+        if (!davClient) {
+          throw new McpError(ErrorCode.InvalidRequest, 'CalDAV not configured. Set FASTMAIL_CALDAV_USERNAME and FASTMAIL_CALDAV_PASSWORD.');
         }
+        const events = await davClient.getCalendarEvents(calendarId, clampLimit(limit, 50, 500), startDate, endDate);
+        return { content: [{ type: 'text', text: JSON.stringify(events, null, 2) }] };
       }
 
       case 'get_calendar_event': {
@@ -1649,18 +2067,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (!eventId) {
           throw new McpError(ErrorCode.InvalidParams, 'eventId is required');
         }
-        try {
-          const contactsClient = initializeContactsCalendarClient();
-          const event = await contactsClient.getCalendarEventById(eventId);
-          return { content: [{ type: 'text', text: JSON.stringify(event, null, 2) }] };
-        } catch {
-          const davClient = initializeCalDAVClient();
-          if (!davClient) {
-            throw new McpError(ErrorCode.InvalidRequest, 'JMAP calendars not available and CalDAV not configured. Set FASTMAIL_CALDAV_USERNAME and FASTMAIL_CALDAV_PASSWORD to use CalDAV.');
-          }
-          const event = await davClient.getCalendarEventById(eventId);
-          return { content: [{ type: 'text', text: JSON.stringify(event, null, 2) }] };
+        const davClient = initializeCalDAVClient();
+        if (!davClient) {
+          throw new McpError(ErrorCode.InvalidRequest, 'CalDAV not configured. Set FASTMAIL_CALDAV_USERNAME and FASTMAIL_CALDAV_PASSWORD.');
         }
+        const event = await davClient.getCalendarEventById(eventId);
+        return { content: [{ type: 'text', text: JSON.stringify(event, null, 2) }] };
       }
 
       case 'create_calendar_event': {
@@ -1668,22 +2080,51 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (!calendarId || !title || !start || !end) {
           throw new McpError(ErrorCode.InvalidParams, 'calendarId, title, start, and end are required');
         }
-        try {
-          const contactsClient = initializeContactsCalendarClient();
-          const eventId = await contactsClient.createCalendarEvent({
-            calendarId, title, description, start, end, location, participants,
-          });
-          return { content: [{ type: 'text', text: `Calendar event created successfully. Event ID: ${eventId}` }] };
-        } catch {
-          const davClient = initializeCalDAVClient();
-          if (!davClient) {
-            throw new McpError(ErrorCode.InvalidRequest, 'JMAP calendars not available and CalDAV not configured. Set FASTMAIL_CALDAV_USERNAME and FASTMAIL_CALDAV_PASSWORD to use CalDAV.');
-          }
-          const eventId = await davClient.createCalendarEvent({
-            calendarId, title, description, start, end, location,
-          });
-          return { content: [{ type: 'text', text: `Calendar event created via CalDAV. Event ID: ${eventId}` }] };
+        const davClient = initializeCalDAVClient();
+        if (!davClient) {
+          throw new McpError(ErrorCode.InvalidRequest, 'CalDAV not configured. Set FASTMAIL_CALDAV_USERNAME and FASTMAIL_CALDAV_PASSWORD.');
         }
+        const eventId = await davClient.createCalendarEvent({
+          calendarId, title, description, start, end, location, participants,
+        });
+        return { content: [{ type: 'text', text: `Calendar event created. Event ID: ${eventId}` }] };
+      }
+
+      case 'update_calendar_event': {
+        const { eventId, title, description, start, end, location, participants, clearFields, confirmRecurring } = args as any;
+        if (!eventId) {
+          throw new McpError(ErrorCode.InvalidParams, 'eventId is required');
+        }
+        const hasClearFields = Array.isArray(clearFields) && clearFields.length > 0;
+        if (title === undefined && description === undefined && start === undefined && end === undefined && location === undefined && participants === undefined && !hasClearFields) {
+          throw new McpError(ErrorCode.InvalidParams, 'At least one field to update must be provided (title, description, start, end, location, participants, or clearFields)');
+        }
+        const davClient = initializeCalDAVClient();
+        if (!davClient) {
+          throw new McpError(ErrorCode.InvalidRequest, 'CalDAV not configured. Set FASTMAIL_CALDAV_USERNAME and FASTMAIL_CALDAV_PASSWORD.');
+        }
+        // Coerce confirmRecurring — a lenient client sending the string "false"
+        // would otherwise read as truthy and authorize destructive pruning of
+        // recurrence exceptions the caller explicitly declined to remove.
+        const fields = {
+          title, description, start, end, location, participants, clearFields,
+          confirmRecurring: coerceBool(confirmRecurring) ?? false,
+        };
+        await davClient.updateCalendarEvent(eventId, fields);
+        return { content: [{ type: 'text', text: `Calendar event updated. Event ID: ${eventId}` }] };
+      }
+
+      case 'delete_calendar_event': {
+        const { eventId } = args as any;
+        if (!eventId) {
+          throw new McpError(ErrorCode.InvalidParams, 'eventId is required');
+        }
+        const davClient = initializeCalDAVClient();
+        if (!davClient) {
+          throw new McpError(ErrorCode.InvalidRequest, 'CalDAV not configured. Set FASTMAIL_CALDAV_USERNAME and FASTMAIL_CALDAV_PASSWORD.');
+        }
+        await davClient.deleteCalendarEvent(eventId);
+        return { content: [{ type: 'text', text: `Calendar event deleted. Event ID: ${eventId}` }] };
       }
 
       case 'list_identities': {
@@ -1701,21 +2142,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'get_recent_emails': {
-        const { limit = 10, mailboxName = 'inbox', ascending } = args as any;
+        const { limit, mailboxName = null, ascending } = args as any;
         const client = initializeClient();
-        const emails = await client.getRecentEmails(limit, mailboxName, !!ascending);
+        const result = await client.getRecentEmails(clampLimit(limit, 10, 50), mailboxName, coerceBool(ascending) ?? false);
         return {
           content: [
             {
               type: 'text',
-              text: JSON.stringify(emails, null, 2),
+              text: formatQueryResult(result),
             },
           ],
         };
       }
 
       case 'mark_email_read': {
-        const { emailId, read = true } = args as any;
+        const { emailId } = args as any;
+        // Coerce so a stringified "false" from a lenient client doesn't read as truthy.
+        const read = coerceBool((args as any).read) ?? true;
         if (!emailId) {
           throw new McpError(ErrorCode.InvalidParams, 'emailId is required');
         }
@@ -1732,7 +2175,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'pin_email': {
-        const { emailId, pinned = true } = args as any;
+        const { emailId } = args as any;
+        const pinned = coerceBool((args as any).pinned) ?? true;
         if (!emailId) {
           throw new McpError(ErrorCode.InvalidParams, 'emailId is required');
         }
@@ -1869,7 +2313,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               content: [
                 {
                   type: 'text',
-                  text: `Saved to: ${savePath} (${result.bytesWritten} bytes)`,
+                  text: `Saved to: ${result.savedPath} (${result.bytesWritten} bytes)`,
                 },
               ],
             };
@@ -1885,9 +2329,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             };
           }
         } catch (error) {
-          // Let path validation errors through so users see why their savePath was rejected
+          // Let path validation errors through so users see why their savePath was rejected.
+          // Redact defensively — the message echoes a caller-influenced path, and a future
+          // upstream error merely containing "Save path" would otherwise pass through raw.
           if (error instanceof Error && (error.message.includes('Save path') || error.message.includes('null bytes'))) {
-            throw new McpError(ErrorCode.InvalidParams, error.message);
+            throw new McpError(ErrorCode.InvalidParams, redactBearerTokens(error.message));
           }
           // Sanitize other errors to avoid leaking attachment metadata
           throw new McpError(
@@ -1897,18 +2343,47 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
       }
 
+      case 'save_attachment_to_webdav': {
+        const { emailId, attachmentId, remotePath, overwrite, createParents } = args as any;
+        if (!emailId || !attachmentId) {
+          throw new McpError(ErrorCode.InvalidParams, 'emailId and attachmentId are required');
+        }
+        if (!remotePath) {
+          throw new McpError(ErrorCode.InvalidParams, 'remotePath is required');
+        }
+        const dav = initializeWebDAVClient();
+        if (!dav) {
+          throw new McpError(ErrorCode.InvalidRequest, 'WebDAV storage not configured. Set FASTMAIL_WEBDAV_URL, FASTMAIL_WEBDAV_USERNAME, and FASTMAIL_WEBDAV_PASSWORD (for Fastmail Files use https://myfiles.fastmail.com/ with a Files-scoped app password).');
+        }
+        const client = initializeClient();
+        const { buffer, type, name } = await client.fetchAttachmentBuffer(emailId, attachmentId);
+        const result = await dav.uploadBuffer(buffer, remotePath, {
+          contentType: type,
+          overwrite: coerceBool(overwrite) ?? false,
+          createParents: coerceBool(createParents) ?? true,
+        });
+        return {
+          content: [
+            {
+              type: 'text',
+              text: redactBearerTokens(JSON.stringify({ ...result, attachmentName: name }, null, 2)),
+            },
+          ],
+        };
+      }
+
       case 'advanced_search': {
         const { query, from, to, subject, hasAttachment, isUnread, isPinned, mailboxId, requiredMailboxIds, excludeMailboxIds, after, before, limit, ascending } = args as any;
         const client = initializeClient();
         const validLimit = Math.min(Math.max(Number(limit) || 50, 1), 100);
-        const emails = await client.advancedSearch({
+        const result = await client.advancedSearch({
           query, from, to, subject, hasAttachment, isUnread, isPinned, mailboxId, requiredMailboxIds, excludeMailboxIds, after, before, limit: validLimit, ascending
         });
         return {
           content: [
             {
               type: 'text',
-              text: JSON.stringify(emails, null, 2),
+              text: formatQueryResult(result),
             },
           ],
         };
@@ -1918,27 +2393,27 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const { query, from, to, subject, hasAttachment, isUnread, isPinned, mailboxId, requiredMailboxIds, excludeMailboxIds, after, before, limit, ascending } = (args ?? {}) as any;
         const client = initializeClient();
         const validLimit = Math.min(Math.max(Number(limit) || 50, 1), 100);
-        const emails = await client.advancedSearchMetadata({
+        const result = await client.advancedSearchMetadata({
           query, from, to, subject, hasAttachment, isUnread, isPinned, mailboxId, requiredMailboxIds, excludeMailboxIds, after, before, limit: validLimit, ascending
         });
         return {
           content: [
             {
               type: 'text',
-              text: JSON.stringify(emails, null, 2),
+              text: formatQueryResult(result),
             },
           ],
         };
       }
 
       case 'get_thread': {
-        const { threadId } = args as any;
+        const { threadId, includeDrafts } = args as any;
         if (!threadId) {
           throw new McpError(ErrorCode.InvalidParams, 'threadId is required');
         }
         const client = initializeClient();
         try {
-          const thread = await client.getThread(threadId);
+          const thread = await client.getThread(threadId, coerceBool(includeDrafts) ?? false);
           return {
             content: [
               {
@@ -2115,7 +2590,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case 'check_function_availability': {
         const client = initializeClient();
         const session = await client.getSession();
-        
+
+        // Calendar tools run on CalDAV, not JMAP. So calendar is available if
+        // EITHER the JMAP calendar capability is present OR CalDAV credentials
+        // are configured (FASTMAIL_CALDAV_USERNAME / FASTMAIL_CALDAV_PASSWORD).
+        const jmapCalendar = !!session.capabilities['urn:ietf:params:jmap:calendars'];
+        const caldavConfigured = initializeCalDAVClient() !== null;
+        const calendarAvailable = jmapCalendar || caldavConfigured;
+        const calendarNote = jmapCalendar
+          ? 'Calendar is available (JMAP)'
+          : caldavConfigured
+            ? 'Calendar is available via CalDAV'
+            : 'Calendar access not available - set FASTMAIL_CALDAV_USERNAME and FASTMAIL_CALDAV_PASSWORD, or enable calendar scope in Fastmail account settings';
+
         const availability = {
           email: {
             available: true,
@@ -2134,9 +2621,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           },
           contacts: {
             available: !!session.capabilities['urn:ietf:params:jmap:contacts'],
-            functions: ['list_contacts', 'get_contact', 'search_contacts'],
-            note: session.capabilities['urn:ietf:params:jmap:contacts'] ? 
-              'Contacts are available' : 
+            functions: ['list_contacts', 'get_contact', 'search_contacts', 'create_contact', 'update_contact', 'delete_contact'],
+            note: session.capabilities['urn:ietf:params:jmap:contacts'] ?
+              'Contacts are available. Write tools (create/update/delete) additionally require the API token to have read-write contacts scope.' :
               'Contacts access not available - may require enabling in Fastmail account settings',
             enablementGuide: session.capabilities['urn:ietf:params:jmap:contacts'] ? null : {
               steps: [
@@ -2149,14 +2636,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             }
           },
           calendar: {
-            available: !!session.capabilities['urn:ietf:params:jmap:calendars'],
-            functions: ['list_calendars', 'list_calendar_events', 'get_calendar_event', 'create_calendar_event'],
-            note: session.capabilities['urn:ietf:params:jmap:calendars'] ? 
-              'Calendar is available' : 
-              'Calendar access not available - may require enabling in Fastmail account settings',
-            enablementGuide: session.capabilities['urn:ietf:params:jmap:calendars'] ? null : {
+            available: calendarAvailable,
+            functions: ['list_calendars', 'list_calendar_events', 'get_calendar_event', 'create_calendar_event', 'update_calendar_event', 'delete_calendar_event'],
+            note: calendarNote,
+            enablementGuide: calendarAvailable ? null : {
               steps: [
-                '1. Log into Fastmail web interface',
+                'Option A (CalDAV): set FASTMAIL_CALDAV_USERNAME and FASTMAIL_CALDAV_PASSWORD (app password) — calendar tools run over CalDAV',
+                'Option B (JMAP scope): 1. Log into Fastmail web interface',
                 '2. Go to Settings → Privacy & Security → Connected Apps & API tokens',
                 '3. Check if calendar scope is enabled for your API token',
                 '4. If not available, you may need to upgrade your Fastmail plan or contact support'
@@ -2164,6 +2650,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               documentation: 'https://www.fastmail.com/help/technical/jmap-api.html'
             }
           },
+          files: (() => {
+            // A malformed configured URL makes initializeWebDAVClient throw —
+            // availability must report that, not fail the whole call.
+            try {
+              return filesAvailabilitySection(initializeWebDAVClient() !== null);
+            } catch (e) {
+              return filesAvailabilitySection(true, e instanceof Error ? redactBearerTokens(e.message) : String(e));
+            }
+          })(),
           capabilities: Object.keys(session.capabilities)
         };
         
@@ -2183,8 +2678,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         
         // Get some recent emails to test with
         const testLimit = Math.min(Math.max(limit, 1), 10);
-        const emails = await client.getRecentEmails(testLimit, 'inbox');
-        
+        const { items: emails } = await client.getRecentEmails(testLimit, 'inbox');
+
         if (emails.length === 0) {
           return {
             content: [
@@ -2254,7 +2749,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 ...operation,
                 status: 'FAILED',
                 executed: false,
-                error: error instanceof Error ? error.message : String(error),
+                error: redactBearerTokens(error instanceof Error ? error.message : String(error)),
                 timestamp: new Date().toISOString()
               });
             }
@@ -2276,7 +2771,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
   } catch (error) {
     if (error instanceof McpError) {
-      throw error;
+      // Redact defensively even on the McpError path — in-file McpErrors are
+      // static today, but this makes redaction a single choke point so a future
+      // McpError built from dynamic content can't slip a secret through.
+      const safe = redactBearerTokens(error.message);
+      if (safe === error.message) throw error;
+      throw new McpError((error as any).code ?? ErrorCode.InternalError, safe);
     }
     const raw = error instanceof Error ? error.message : String(error);
     throw new McpError(

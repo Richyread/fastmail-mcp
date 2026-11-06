@@ -1,6 +1,7 @@
 import { describe, it, beforeEach, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { JmapClient, buildEmailQueryFilter } from './jmap-client.js';
+import { ContactsCalendarClient } from './contacts-calendar.js';
 import { FastmailAuth } from './auth.js';
 
 // ---------- helpers ----------
@@ -87,9 +88,9 @@ describe('getRecentEmails', () => {
       ],
     });
 
-    const emails = await client.getRecentEmails(10, 'inbox');
-    assert.equal(emails.length, 2);
-    assert.equal(emails[0].subject, 'First');
+    const result = await client.getRecentEmails(10, 'inbox');
+    assert.equal(result.items.length, 2);
+    assert.equal(result.items[0].subject, 'First');
   });
 
   it('throws when mailbox is not found', async () => {
@@ -113,8 +114,58 @@ describe('getRecentEmails', () => {
       ],
     });
 
-    const emails = await client.getRecentEmails(5, 'inbox');
-    assert.deepEqual(emails, []);
+    const result = await client.getRecentEmails(5, 'inbox');
+    assert.deepEqual(result.items, []);
+  });
+
+  it('defaults to all mailboxes except Trash and Spam when no mailbox is given', async () => {
+    stubMailboxes(client, [
+      INBOX_MAILBOX,
+      SENT_MAILBOX,
+      TRASH_MAILBOX,
+      { id: 'mb-junk', name: 'Spam', role: 'junk' },
+    ]);
+    const makeReq = mock.method(client, 'makeRequest', async () => ({
+      methodResponses: [
+        ['Email/query', { ids: [] }, 'query'],
+        ['Email/get', { list: [] }, 'emails'],
+      ],
+    }));
+
+    await client.getRecentEmails(10);
+
+    const filter = makeReq.mock.calls[0].arguments[0].methodCalls[0][1].filter;
+    assert.deepEqual(filter, { inMailboxOtherThan: ['mb-trash', 'mb-junk'] });
+  });
+
+  it('uses an unfiltered query when no Trash/Spam mailboxes exist', async () => {
+    stubMailboxes(client, [INBOX_MAILBOX, SENT_MAILBOX]);
+    const makeReq = mock.method(client, 'makeRequest', async () => ({
+      methodResponses: [
+        ['Email/query', { ids: [] }, 'query'],
+        ['Email/get', { list: [] }, 'emails'],
+      ],
+    }));
+
+    await client.getRecentEmails(10);
+
+    const filter = makeReq.mock.calls[0].arguments[0].methodCalls[0][1].filter;
+    assert.deepEqual(filter, {});
+  });
+
+  it('still scopes to a single mailbox when one is named', async () => {
+    stubMailboxes(client);
+    const makeReq = mock.method(client, 'makeRequest', async () => ({
+      methodResponses: [
+        ['Email/query', { ids: [] }, 'query'],
+        ['Email/get', { list: [] }, 'emails'],
+      ],
+    }));
+
+    await client.getRecentEmails(10, 'sent');
+
+    const filter = makeReq.mock.calls[0].arguments[0].methodCalls[0][1].filter;
+    assert.deepEqual(filter, { inMailbox: 'mb-sent' });
   });
 });
 
@@ -135,8 +186,8 @@ describe('getEmails', () => {
       ],
     }));
 
-    const emails = await client.getEmails('mb-inbox', 5);
-    assert.equal(emails.length, 1);
+    const result = await client.getEmails('mb-inbox', 5);
+    assert.equal(result.items.length, 1);
 
     const filter = makeReq.mock.calls[0].arguments[0].methodCalls[0][1].filter;
     assert.equal(filter.inMailbox, 'mb-inbox');
@@ -150,8 +201,8 @@ describe('getEmails', () => {
       ],
     }));
 
-    const emails = await client.getEmails(undefined, 10);
-    assert.equal(emails.length, 1);
+    const result = await client.getEmails(undefined, 10);
+    assert.equal(result.items.length, 1);
 
     const filter = makeReq.mock.calls[0].arguments[0].methodCalls[0][1].filter;
     assert.deepEqual(filter, {});
@@ -940,5 +991,384 @@ describe('advancedSearch and advancedSearchMetadata wire requiredMailboxIds corr
 
     const filter = makeReq.mock.calls[0].arguments[0].methodCalls[0][1].filter;
     assert.deepEqual(filter, { inMailbox: 'mb-only' });
+  });
+});
+
+describe('getThread draft handling', () => {
+  let client: JmapClient;
+
+  beforeEach(() => {
+    client = makeClient();
+  });
+
+  // A thread containing a normal email plus an in-progress draft reply.
+  const stubThreadWithDraft = () => {
+    let callCount = 0;
+    return mock.method(client, 'makeRequest', async () => {
+      callCount++;
+      if (callCount === 1) {
+        return {
+          methodResponses: [
+            ['Email/get', { list: [{ threadId: 'thread-1' }] }, 'checkEmail'],
+          ],
+        };
+      }
+      return {
+        methodResponses: [
+          ['Thread/get', { list: [{ id: 'thread-1', emailIds: ['e1', 'e2'] }] }, 'getThread'],
+          ['Email/get', { list: [
+            { id: 'e1', subject: 'Sent message', keywords: { $seen: true } },
+            { id: 'e2', subject: 'Draft reply', keywords: { $draft: true } },
+          ] }, 'emails'],
+        ],
+      };
+    });
+  };
+
+  it('excludes draft messages by default', async () => {
+    stubThreadWithDraft();
+    const thread = await client.getThread('e1');
+    assert.equal(thread.length, 1);
+    assert.equal(thread[0].id, 'e1');
+  });
+
+  it('includes drafts when includeDrafts is true', async () => {
+    stubThreadWithDraft();
+    const thread = await client.getThread('e1', true);
+    assert.equal(thread.length, 2);
+    assert.deepEqual(thread.map((e: any) => e.id), ['e1', 'e2']);
+  });
+});
+
+// ---------- total result count (calculateTotal / QueryResult) ----------
+
+describe('query total result count', () => {
+  let client: JmapClient;
+
+  beforeEach(() => {
+    client = makeClient();
+  });
+
+  it('getEmails requests calculateTotal on Email/query', async () => {
+    const makeReq = mock.method(client, 'makeRequest', async () => ({
+      methodResponses: [
+        ['Email/query', { ids: [] }, 'query'],
+        ['Email/get', { list: [] }, 'emails'],
+      ],
+    }));
+
+    await client.getEmails('mb-inbox', 5);
+
+    assert.equal(makeReq.mock.calls[0].arguments[0].methodCalls[0][1].calculateTotal, true);
+  });
+
+  it('surfaces the server-reported total alongside the items', async () => {
+    stubMakeRequest(client, {
+      methodResponses: [
+        ['Email/query', { ids: ['e1'], total: 42 }, 'query'],
+        ['Email/get', { list: [{ id: 'e1', subject: 'Only one fetched' }] }, 'emails'],
+      ],
+    });
+
+    const result = await client.getEmails('mb-inbox', 1);
+    assert.equal(result.total, 42);
+    assert.equal(result.items.length, 1);
+  });
+
+  it('omits total when the server does not report one', async () => {
+    stubMakeRequest(client, {
+      methodResponses: [
+        ['Email/query', { ids: ['e1'] }, 'query'],
+        ['Email/get', { list: [{ id: 'e1' }] }, 'emails'],
+      ],
+    });
+
+    const result = await client.getEmails('mb-inbox', 1);
+    assert.equal('total' in result, false);
+    assert.equal(result.items.length, 1);
+  });
+
+  it('metadata variants request and surface the total without widening the property allowlist', async () => {
+    const makeReq = mock.method(client, 'makeRequest', async () => ({
+      methodResponses: [
+        ['Email/query', { ids: ['e1'], total: 7 }, 'query'],
+        ['Email/get', { list: [{ id: 'e1', subject: 'Meta' }] }, 'emails'],
+      ],
+    }));
+
+    const result = await client.getEmailsMetadata('mb-inbox', 1);
+
+    assert.equal(makeReq.mock.calls[0].arguments[0].methodCalls[0][1].calculateTotal, true);
+    assert.equal(result.total, 7);
+    const props = makeReq.mock.calls[0].arguments[0].methodCalls[1][1].properties;
+    assert.equal(props.includes('preview'), false);
+    assert.equal(props.some((p: string) => p.startsWith('body')), false);
+  });
+
+  it('searchEmails and advancedSearch surface the total', async () => {
+    stubMakeRequest(client, {
+      methodResponses: [
+        ['Email/query', { ids: ['e1'], total: 99 }, 'query'],
+        ['Email/get', { list: [{ id: 'e1' }] }, 'emails'],
+      ],
+    });
+
+    const search = await client.searchEmails('test', 1);
+    assert.equal(search.total, 99);
+
+    const advanced = await client.advancedSearch({ query: 'test', limit: 1 });
+    assert.equal(advanced.total, 99);
+  });
+});
+
+describe('getContacts total result count', () => {
+  function makeContactsClient(): ContactsCalendarClient {
+    const auth = new FastmailAuth({ apiToken: 'fake-token' });
+    const client = new ContactsCalendarClient(auth);
+
+    mock.method(client, 'getSession', async () => ({
+      apiUrl: 'https://api.example.com/jmap/api/',
+      accountId: ACCOUNT_ID,
+      capabilities: { 'urn:ietf:params:jmap:contacts': {} },
+    }));
+
+    return client;
+  }
+
+  it('surfaces the total from ContactCard/query', async () => {
+    const client = makeContactsClient();
+    stubMakeRequest(client, {
+      methodResponses: [
+        ['ContactCard/query', { ids: ['c1'], total: 250 }, 'query'],
+        ['ContactCard/get', { list: [{ id: 'c1', name: 'Test Person' }] }, 'contacts'],
+      ],
+    });
+
+    const result = await client.getContacts(1);
+    assert.equal(result.total, 250);
+    assert.equal(result.items.length, 1);
+  });
+
+  it('AddressBook fallback returns items without a total', async () => {
+    const client = makeContactsClient();
+    let call = 0;
+    mock.method(client, 'makeRequest', async () => {
+      call += 1;
+      if (call === 1) {
+        throw new Error('ContactCard/query not supported');
+      }
+      return {
+        methodResponses: [
+          ['AddressBook/get', { list: [{ id: 'ab1', name: 'Default' }] }, 'addressbooks'],
+        ],
+      };
+    });
+
+    const result = await client.getContacts(10);
+    assert.equal('total' in result, false);
+    assert.equal(result.items.length, 1);
+  });
+});
+
+describe('getContactById not-found', () => {
+  function makeContactsClient(): ContactsCalendarClient {
+    const auth = new FastmailAuth({ apiToken: 'fake-token' });
+    const client = new ContactsCalendarClient(auth);
+
+    mock.method(client, 'getSession', async () => ({
+      apiUrl: 'https://api.example.com/jmap/api/',
+      accountId: ACCOUNT_ID,
+      capabilities: { 'urn:ietf:params:jmap:contacts': {} },
+    }));
+
+    return client;
+  }
+
+  it('returns the contact when it exists', async () => {
+    const client = makeContactsClient();
+    stubMakeRequest(client, {
+      methodResponses: [
+        ['ContactCard/get', { list: [{ id: 'c1', name: 'Real Person' }] }, 'contact'],
+      ],
+    });
+
+    const contact = await client.getContactById('c1');
+    assert.equal(contact.id, 'c1');
+  });
+
+  it('throws instead of returning undefined for an unknown id', async () => {
+    const client = makeContactsClient();
+    stubMakeRequest(client, {
+      methodResponses: [
+        ['ContactCard/get', { list: [], notFound: ['ghost'] }, 'contact'],
+      ],
+    });
+
+    await assert.rejects(
+      () => client.getContactById('ghost'),
+      /Contact not found: ghost/
+    );
+  });
+});
+
+// ---------- attachments on send (uploadBlob / resolveAttachments / carry-over) ----------
+
+describe('attachments on send', () => {
+  const IDENTITY = { id: 'id-1', name: 'Test User', email: 'me@example.com', mayDelete: false };
+  const SESSION_WITH_UPLOAD = {
+    apiUrl: 'https://api.example.com/jmap/api/',
+    accountId: ACCOUNT_ID,
+    capabilities: { 'urn:ietf:params:jmap:core': { maxSizeUpload: 1024 } },
+    uploadUrl: 'https://api.fastmail.com/jmap/upload/{accountId}/',
+    downloadUrl: 'https://www.fastmailusercontent.com/jmap/download/{accountId}/{blobId}/{name}?type={type}',
+  };
+
+  function makeUploadClient(): JmapClient {
+    const auth = new FastmailAuth({ apiToken: 'fake-token' });
+    const client = new JmapClient(auth);
+    mock.method(client, 'getSession', async () => SESSION_WITH_UPLOAD);
+    return client;
+  }
+
+  it('uploadBlob POSTs to the substituted uploadUrl with Content-Type and no redirects', async () => {
+    const client = makeUploadClient();
+    const fetchMock = mock.method(globalThis, 'fetch', async () => new Response(
+      JSON.stringify({ blobId: 'B1', type: 'text/plain', size: 5 }), { status: 200 },
+    ));
+    try {
+      const out = await client.uploadBlob(Buffer.from('hello'), 'text/plain');
+      assert.equal(out.blobId, 'B1');
+      const [url, opts] = fetchMock.mock.calls[0].arguments;
+      assert.equal(url, `https://api.fastmail.com/jmap/upload/${ACCOUNT_ID}/`);
+      assert.equal(opts.method, 'POST');
+      assert.equal(opts.headers['Content-Type'], 'text/plain');
+      assert.equal(opts.redirect, 'error');
+    } finally { fetchMock.mock.restore(); }
+  });
+
+  it('uploadBlob rejects payloads above maxSizeUpload before any network call', async () => {
+    const client = makeUploadClient();
+    const fetchMock = mock.method(globalThis, 'fetch', async () => { throw new Error('should not fetch'); });
+    try {
+      await assert.rejects(
+        () => client.uploadBlob(Buffer.alloc(2048), 'application/octet-stream'),
+        /upload limit/,
+      );
+      assert.equal(fetchMock.mock.calls.length, 0);
+    } finally { fetchMock.mock.restore(); }
+  });
+
+  it('resolveAttachments reuses an existing attachment blobId with zero byte transfer', async () => {
+    const client = makeUploadClient();
+    stubMakeRequest(client, {
+      methodResponses: [
+        ['Email/get', { list: [{ id: 'e1', attachments: [
+          { partId: 'p2', blobId: 'BLOB-existing', type: 'application/pdf', name: 'report.pdf', size: 9 },
+        ] }] }, 'getEmail'],
+      ],
+    });
+    const fetchMock = mock.method(globalThis, 'fetch', async () => { throw new Error('no fetch expected'); });
+    try {
+      const parts = await client.resolveAttachments([{ emailId: 'e1', attachmentId: 'p2' }]);
+      assert.deepEqual(parts, [{ blobId: 'BLOB-existing', type: 'application/pdf', name: 'report.pdf', disposition: 'attachment' }]);
+      assert.equal(fetchMock.mock.calls.length, 0);
+    } finally { fetchMock.mock.restore(); }
+  });
+
+  it('resolveAttachments rejects entries with zero or multiple sources', async () => {
+    const client = makeUploadClient();
+    await assert.rejects(() => client.resolveAttachments([{ name: 'x.txt' }]), /exactly one source/);
+    await assert.rejects(
+      () => client.resolveAttachments([{ blobId: 'B', localPath: 'a.txt' }]),
+      /exactly one source/,
+    );
+  });
+
+  it('sendEmail places attachments as the RFC 8621 convenience property, never bodyStructure', async () => {
+    const client = makeUploadClient();
+    mock.method(client, 'getIdentities', async () => [IDENTITY]);
+    mock.method(client, 'getMailboxes', async () => [DRAFTS_MAILBOX, SENT_MAILBOX]);
+    const makeReq = mock.method(client, 'makeRequest', async () => ({
+      methodResponses: [
+        ['Email/set', { created: { draft: { id: 'e9' } } }, 'createEmail'],
+        ['EmailSubmission/set', { created: { submission: { id: 's9' } } }, 'submitEmail'],
+      ],
+    }));
+
+    await client.sendEmail({
+      to: ['me@example.com'], subject: 'With attachment', textBody: 'body',
+      attachments: [{ blobId: 'B7', name: 'notes.txt', type: 'text/plain' }],
+    });
+
+    const draft = makeReq.mock.calls[0].arguments[0].methodCalls[0][1].create.draft;
+    assert.deepEqual(draft.attachments, [{ blobId: 'B7', type: 'text/plain', name: 'notes.txt', disposition: 'attachment' }]);
+    assert.equal('bodyStructure' in draft, false);
+    assert.ok(draft.textBody, 'convenience textBody must survive alongside attachments');
+  });
+
+  it('updateDraft carries existing attachments through the recreate (regression)', async () => {
+    const client = makeUploadClient();
+    mock.method(client, 'getIdentities', async () => [IDENTITY]);
+    const makeReq = mock.method(client, 'makeRequest', async (req: any) => {
+      if (req.methodCalls[0][0] === 'Email/get') {
+        return { methodResponses: [['Email/get', { list: [{
+          id: 'd1', subject: 'Draft', keywords: { $draft: true }, mailboxIds: { 'mb-drafts': true },
+          from: [{ email: 'me@example.com' }],
+          textBody: [{ partId: 't1', type: 'text/plain' }],
+          bodyValues: { t1: { value: 'original body' } },
+          attachments: [{ blobId: 'B-keep', type: 'image/png', name: 'pic.png', disposition: 'attachment' }],
+        }] }, 'getEmail']] };
+      }
+      return { methodResponses: [['Email/set', { created: { draft: { id: 'd2' } } }, 'updateDraft']] };
+    });
+
+    await client.updateDraft('d1', { subject: 'Edited subject only' });
+
+    const setCall = makeReq.mock.calls.find((c: any) => c.arguments[0].methodCalls[0][0] === 'Email/set');
+    const recreated = setCall.arguments[0].methodCalls[0][1].create.draft;
+    assert.deepEqual(recreated.attachments, [{ blobId: 'B-keep', type: 'image/png', name: 'pic.png', disposition: 'attachment' }]);
+  });
+
+  it('updateDraft fetches the attachments property (the old request silently dropped them)', async () => {
+    const client = makeUploadClient();
+    mock.method(client, 'getIdentities', async () => [IDENTITY]);
+    const makeReq = mock.method(client, 'makeRequest', async (req: any) => {
+      if (req.methodCalls[0][0] === 'Email/get') {
+        return { methodResponses: [['Email/get', { list: [{
+          id: 'd1', keywords: { $draft: true }, mailboxIds: { 'mb-drafts': true }, from: [{ email: 'me@example.com' }],
+        }] }, 'getEmail']] };
+      }
+      return { methodResponses: [['Email/set', { created: { draft: { id: 'd2' } } }, 'updateDraft']] };
+    });
+    await client.updateDraft('d1', { subject: 'x' });
+    const props = makeReq.mock.calls[0].arguments[0].methodCalls[0][1].properties;
+    assert.ok(props.includes('attachments'), 'Email/get must request attachments');
+  });
+});
+
+describe('validateReadPath', () => {
+  it('rejects paths that lexically escape the download dir', async () => {
+    await assert.rejects(
+      () => JmapClient.validateReadPath('../outside.txt', '/tmp/fastmail-allowed'),
+      /must be within/,
+    );
+  });
+
+  it('reads a real file inside the dir and rejects a symlink escaping it', async () => {
+    const { mkdtempSync, writeFileSync, symlinkSync } = await import('fs');
+    const { tmpdir } = await import('os');
+    const { join } = await import('path');
+    const allowed = mkdtempSync(join(tmpdir(), 'fm-read-'));
+    const outside = mkdtempSync(join(tmpdir(), 'fm-out-'));
+    writeFileSync(join(allowed, 'ok.txt'), 'fine');
+    writeFileSync(join(outside, 'secret.txt'), 'secret');
+    symlinkSync(join(outside, 'secret.txt'), join(allowed, 'sneaky.txt'));
+
+    const good = await JmapClient.validateReadPath('ok.txt', allowed);
+    assert.ok(good.endsWith('ok.txt'));
+    await assert.rejects(
+      () => JmapClient.validateReadPath('sneaky.txt', allowed),
+      /must resolve within/,
+    );
   });
 });

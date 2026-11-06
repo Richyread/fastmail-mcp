@@ -13,6 +13,114 @@ describe('validateFastmailUrl (default policy)', () => {
     assert.equal(url.hostname, 'www.fastmailusercontent.com');
   });
 
+  it('accepts a regional API host', () => {
+    // Fastmail session discovery returns region-pinned endpoints for some
+    // accounts, e.g. apiUrl/uploadUrl on phl.api.fastmail.com.
+    const url = validateFastmailUrl('https://phl.api.fastmail.com/jmap/api/', 'session.apiUrl');
+    assert.equal(url.hostname, 'phl.api.fastmail.com');
+  });
+
+  it('accepts a regional user-content host', () => {
+    // The user-content host spells the region with a hyphen, not a dot.
+    const url = validateFastmailUrl(
+      'https://phl-www.fastmailusercontent.com/jmap/download/x/y/z',
+      'session.downloadUrl',
+    );
+    assert.equal(url.hostname, 'phl-www.fastmailusercontent.com');
+  });
+
+  it('accepts a multi-part regional prefix', () => {
+    assert.equal(
+      validateFastmailUrl('https://us-west1.api.fastmail.com/jmap/api/', 'apiUrl').hostname,
+      'us-west1.api.fastmail.com',
+    );
+    assert.equal(
+      validateFastmailUrl('https://us-west1-www.fastmailusercontent.com/x', 'downloadUrl').hostname,
+      'us-west1-www.fastmailusercontent.com',
+    );
+  });
+
+  it('rejects a regional prefix carrying extra labels', () => {
+    // Only one label may precede the fixed suffix, so an attacker-controlled
+    // host cannot hide in front of a legitimate-looking regional prefix.
+    assert.throws(
+      () => validateFastmailUrl('https://evil.phl.api.fastmail.com/jmap/api/', 'baseUrl'),
+      /not in the Fastmail allowlist/,
+    );
+    assert.throws(
+      () => validateFastmailUrl('https://evil.phl-www.fastmailusercontent.com/x', 'baseUrl'),
+      /not in the Fastmail allowlist/,
+    );
+  });
+
+  it('rejects a regional-looking prefix on the wrong domain', () => {
+    assert.throws(
+      () => validateFastmailUrl('https://phl.api.fastmail.com.attacker.com/', 'baseUrl'),
+      /not in the Fastmail allowlist/,
+    );
+    assert.throws(
+      () => validateFastmailUrl('https://phl-www.fastmailusercontent.com.attacker.com/', 'baseUrl'),
+      /not in the Fastmail allowlist/,
+    );
+  });
+
+  it('rejects a regional prefix on a non-API fastmail host', () => {
+    // The prefix is only allowed in front of the two endpoint hosts.
+    assert.throws(
+      () => validateFastmailUrl('https://phl.www.fastmail.com/jmap/api/', 'baseUrl'),
+      /not in the Fastmail allowlist/,
+    );
+  });
+
+  // The whole IDN-safety argument rests on `new URL()` punycoding the hostname
+  // before the [a-z0-9] region class ever sees it. Pin it: a Cyrillic-'а'
+  // homograph of api.fastmail.com must reject (it punycodes to xn--...).
+  it('rejects a homograph/IDN host that looks like an allowed one', () => {
+    assert.throws(
+      () => validateFastmailUrl('https://аpi.fastmail.com/jmap/api/', 'baseUrl'),
+      /not in the Fastmail allowlist/,
+    );
+  });
+
+  // Embedded userinfo must not smuggle an allowed name past the host check —
+  // the real hostname here is evil.com.
+  it('rejects an allowed name embedded as userinfo', () => {
+    assert.throws(
+      () => validateFastmailUrl('https://api.fastmail.com@evil.com/jmap/api/', 'baseUrl'),
+      /not in the Fastmail allowlist/,
+    );
+  });
+
+  // A trailing dot (absolute DNS form) is a distinct hostname and must fail
+  // closed rather than sneak past the anchored regex.
+  it('rejects a trailing-dot variant of an allowed host', () => {
+    assert.throws(
+      () => validateFastmailUrl('https://api.fastmail.com./jmap/api/', 'baseUrl'),
+      /not in the Fastmail allowlist/,
+    );
+  });
+
+  // The API host uses a dotted region label; a hyphenated prefix (the
+  // user-content spelling) on the API host is NOT an allowed shape.
+  it('rejects the hyphenated region spelling on the API host', () => {
+    assert.throws(
+      () => validateFastmailUrl('https://phl-api.fastmail.com/jmap/api/', 'baseUrl'),
+      /not in the Fastmail allowlist/,
+    );
+  });
+
+  it('still allows an explicitly opted-in unsafe host (self-hosted JMAP)', () => {
+    const url = validateFastmailUrl('https://jmap.self-hosted.example/jmap/api/', 'baseUrl', true);
+    assert.equal(url.hostname, 'jmap.self-hosted.example');
+  });
+
+  it('rejects even an opted-in host when it is not HTTPS', () => {
+    assert.throws(
+      () => validateFastmailUrl('http://jmap.self-hosted.example/', 'baseUrl', true),
+      /must use HTTPS/,
+    );
+  });
+
   it('rejects HTTP even on allowed host', () => {
     assert.throws(
       () => validateFastmailUrl('http://api.fastmail.com/jmap/api/', 'baseUrl'),
@@ -67,7 +175,7 @@ describe('validateFastmailUrl (default policy)', () => {
   });
 
   it('rejects host that ends with allowlisted domain (suffix-attack)', () => {
-    // Confirms exact-match check, not endsWith.
+    // Confirms the patterns are anchored at the end — a suffix match is not enough.
     assert.throws(
       () => validateFastmailUrl('https://evilapi.fastmail.com.attacker.com/', 'baseUrl'),
       /not in the Fastmail allowlist/,
